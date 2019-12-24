@@ -1,0 +1,170 @@
+import pandas as pd
+from datetime import datetime, timedelta
+import numpy as np
+df=pd.read_csv('C:/Users/shubham.deshmukh/Documents/shubham deshmukh/ShubhamBackup/Cisco/CISCO/FRCT For Amol Project/RAW files_with_text/June/5-8june.csv',engine='python')
+df=df.sample(10000)
+df_text=df.loc[:,['Email Message ID','Text Body']]
+
+df.drop(['Email Message ID','Text Body'], axis=1, inplace=True)
+date_format_open = "%m/%d/%Y %H:%M %p"
+date_format_closed="%m/%d/%Y %H:%M %p"
+#date_format_open_exception = "%Y/%d/%m %H:%M:%S"
+df['Date/Time Closed'][0:150]
+
+date_diff=list()
+date=list()
+for i in df.index:
+    try:
+       
+        d = datetime.strptime(str(df['Date/Time Opened'][i]), date_format_open)
+        d1=datetime.strptime(str(df['Date/Time Closed'][i]),date_format_closed)
+        
+        k=d1-d
+        date_diff.append(k.days)
+        date.append(datetime.strftime(d1,"%Y-%m-%d"))
+    except ValueError:
+        date_diff.append("None occur")
+        date.append(datetime.strftime(d1,"%Y-%m-%d"))
+        pass
+              
+df['Response_date_time']=date_diff
+df['Date']=date
+df['Date']=pd.to_datetime(df['Date'])
+
+date_reference=pd.read_excel("C:/Users/shubham.deshmukh/Documents/shubham deshmukh/ShubhamBackup/Cisco/CISCO/FRCT For Amol Project/Reference files/date_reference.xlsx")
+
+date_reference=date_reference.iloc[:,1:5]
+date_reference=date_reference.rename(columns={"V1":"Date","V2":"Week_Day","V3":"WeekNumber","V4":"Month"})
+
+df = pd.merge(df,
+                 date_reference,
+                 on='Date', 
+                 how='left')
+				 
+df=df.tail(-5).
+
+
+df1=pd.read_csv("C:/Users/shubham.deshmukh/Documents/shubham deshmukh/ShubhamBackup/Cisco/CISCO/FRCT For Amol Project/Reference files/Raw data closed cases.csv")
+
+df_new = pd.merge(df,
+                 df1,
+                 on='Case Number', 
+                 how='left')
+				 
+set(df_new['Duplicate case']!=1.0)
+
+
+df_new=df_new.dropna('Email Message ID')
+
+
+exclude_rows=df_new[(df_new['Case Origin_y'] =='Copied from SR') |
+                    (df_new['Case Origin_y'] =='System Generated') |
+                    (df_new['SPAM Case']==1.0)|
+                    df_new['Duplicate case']==1.0].index.values.tolist()
+
+df_new['Include_Exclude']='Include'
+
+
+df_new['Include_Exclude'][exclude_rows]='Exclude'
+df_include=df_new[(df_new['Include_Exclude']=='Include')]
+del date_reference
+del df_new
+del df1
+del df
+Alias_reference=pd.read_csv('C:/Users/shubham.deshmukh/Documents/shubham deshmukh/ShubhamBackup/Cisco/CISCO/FRCT For Amol Project/Reference files/SRalias names.csv')
+
+Alias_reference.columns=['SR Alias','Cisco_add','Alias_address']
+
+df_include.columns
+
+
+def agent_n_customer(df_include):
+    condition_one=df_include[(df_include['Is Incoming'] ==0.0)].index.values.tolist()
+    
+    df_include['Type']=""
+    df_include.Type[condition_one]='Agent'
+
+    condition_second_p1=df_include[(df_include['Is Incoming'] ==1.0) & 
+           np.logical_not(df_include['From Address'].str.endswith('@cisco.com'))].index.values.tolist()
+    
+    df_include.Type[condition_second_p1]='Customer'
+    
+    condition_second_p2=df_include[(df_include['Is Incoming'] ==1.0) & 
+                             (df_include['From Address'].str.endswith('@cisco.com')) &
+                             (df_include['From Address'].isin(Alias_reference['Alias_address']).astype(str))].index.values.tolist()
+    df_include.Type[condition_second_p2]='Agent'   
+
+    condition_second_p3=df_include[(df_include['Is Incoming'] ==1.0) & 
+    (df_include['From Address'].str.endswith('@cisco.com')) &
+    np.isin(df_include['From Address'], Alias_reference['Alias_address'], invert=True)].index.values.tolist()
+
+    
+    df_include.Type[condition_second_p3]='Customer'
+    return(df_include)
+     
+	 
+df_include=agent_n_customer(df_include)
+
+
+df_customer=df_include[df_include['Type']=='Customer']
+
+
+df2=df[(df['Email Message ID'].astype(str).isin(df_customer['Email Message ID'].astype(str)))]
+
+
+df_customer=df_customer[np.isin(df_customer['From Address'],["payable-jp@cisco.com","no-reply-cpe@cisco.com","donotreply@cisco.com","csgbprod@cisco.com","mailguard@cisco.com","cg1prd_do_not_reply@cisco.com"],invert=True)]
+
+vendor_name=["INFOSYS","CONCENTRIX","CONVERGYS", "ACCENTURE","nan", "WIPRO",  "TELEPLAN", "SCHENKER",  "ZENSAR"]
+vendor_site=["BANGALORE","PUNE","COSTA RICA","SOFIA","DALIAN","HEREDIA","nan","BRNO","HANGZHOU","APPLETON","Raleigh(NC)","SAN JOSE","WARSAW"]
+df_customer.loc[np.isin(df_customer['Vendor'].astype(str),vendor_name,invert=True),'Vendor']='Others'
+df_customer.loc[np.isin(df_customer['Vendor Site'].astype(str),vendor_site,invert=True),'Vendor Site']='Others'
+cat_tree=pd.read_csv('C:/Users/shubham.deshmukh/Documents/shubham deshmukh/ShubhamBackup/Cisco/CISCO/FRCT For Amol Project/Reference files/cat_tree_pe_updated_py.csv')
+df_customer_new = pd.merge(df_customer,
+                 cat_tree,
+                 on=['Service Category_x','Service Name_x','Service Offering_x','Case Type_x'], 
+                 how='left')
+
+df_customer_new=df_customer_new[df_customer_new['Include']==1.0]
+
+
+df_customer_new.to_csv('test3.csv')
+df_text['Text Body']=df_text['Text Body'].str.lower()
+
+k=df_text['Text Body'].replace('[-]{15} original message [-]{15}.*','',regex=True)
+#.replace('[-]{6} original message [-]{6}.*','',regex=True)
+.replace('[-]{6} original message [-]{6}.*','',regex=True)
+.replace('from:.*',' ',regex=True)
+.replace('cisco support[[:space:]]{0,1}-[[:space:]]{0,1}english.*','',regex=True)
+.replace('[[](s?)(f|ht)tp(s?)://\\S+\\b[]]','',regex=True)
+.replace('(s?)(f|ht)tp(s?)://\\S+\\b','',regex=True)
+.replace('[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+','',regex=True)
+.replace('[[]cid:.*?[]]','',regex=True)
+.replace('think before you print','',regex=False)
+.replace('this email may contain confidential and privileged materia.*?and delete all copies of this message','',regex=True)
+.replace('please click here.*?registration information','',regex=True)
+.replace('please click the link below','',regex=True).replace('[\t\n\r]+','\n',regex=True)
+.replace('[-]+','',regex=True).replace('[<][u][+].*?[>]','',regex=True).replace('n[[:space:]]+','\n',regex=True)
+.replace('[[:space:]]+?\n','\n',regex=True).replace('[\t\n\r]+','\n',regex=True)
+.replace('\n(thanks[,|.]{0,1}|kind[,|.]{0,1}|warmest[,|.]{0,1}|thanks and|thanks &|best[,|.]{0,1}|warm[,|.]{0,1}|regards[,|.]{0,1})\n.*','',regex=True)
+.replace('\n(thanks[,|.]{0,1}|kind[,|.]{0,1}|warmest[,|.]{0,1}|thanks and|thanks &|best[,|.]{0,1}|warm[,|.]{0,1}|regards[,|.]{0,1})?\\sregards[,|.]{0,1}.*','',regex=True)
+.replace('\n(\\S+ \\S+ \\S+ \\S+ manager[,|.]{0,1}|\\S+ \\S+ \\S+ manager[,|.]{0,1}|\\S+ \\S+ manager[,|.]{0,1}|\\S+ manager[,|.]{0,1}|manager[,|.]{0,1}).*','',regex=True)
+.replace('\n(wrote[:]|senior customer service engagement representative[,]{0,1}).*','',regex=True)
+.replace('\n(contract[:]|tax[:]|tel[:]|direct[:]|office[:]|mobile[:]|mob[:]|m[:]).*','',regex=True)
+.replace('\n(contract[:]|tax[:]|phone[:]|telephone[:]|tele[:]|tel[:]|direct[:]|office[:]|mobile[:]).*','',regex=True)
+.replace('[\t\n\r]','.',regex=True).replace('[.]{3,4}','.',regex=True).replace('[.]{2,3}','.',regex=True)
+.replace('[.]{2,3}','.',regex=True).replace('[.]{2,3}','.',regex=True).replace('[.]{2,3}','.',regex=True)
+.replace('[-][-].+original message.*',' ',regex=True).replace('regards.*',' ',regex=True)
+.replace('cisco support - english',' ',regex=True)
+.replace('think before you print.this email may contain confidential and privileged material for the sole use of the intended recipient. any review, use, distribution or disclosure by others is strictly prohibited. if you are not the intended recipient (or authorized to receive for the recipient), please contact the sender by reply email and delete all copies of this message.preferences  <U+393C><U+3E36> unsubscribe  <U+393C><U+3E36> privacy please click here  for company registration information',' ',regex=True)
+.replace('[[:digit:]]+',' ',regex=True).replace('[^[:alnum:]]',' ',regex=True)
+.replace('[^[:alnum:][:blank:]?&/\\-]',' ',regex=True).replace('U....','',regex=True)
+.replace('cisco support - english',' ',regex=True).replace('[\t\n\r]',' ',regex=True)
+.replace('[.]{3,4}',' ',regex=True).replace('[.]{2,3}',' ',regex=True)
+.replace('(s?)(f|ht)tp(s?)://\\S+\\b',' ',regex=True).replace('[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+',' ',regex=True)
+.replace('/[^@\s]*@[^@\s]*\.[^@\s]*/',' ',regex=True).replace('/[^@\s]*@[^@\s]*\.[^@\s]*/',' ',regex=True)
+.replace('[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+',' ',regex=True).replace('[^0-9a-z #+_]',' ',regex=True)
+.replace('[/(){}\[\]\|@,;]',' ',regex=True).replace(' \d+',' ',regex=True)
+#df_text['Text Body'].str.strip()
+#df_text['Text Body'].str.strip()
+
+df_text.to_csv('test1_text.csv')
