@@ -35,7 +35,7 @@ print(f"Loaded real text with {all_ids.size(0)} tokens.")
 
 def run_scenario(context_ids, offload_to_cpu: bool):
     torch.cuda.reset_peak_memory_stats(device)
-    # Warm up
+
     input_ids = context_ids.unsqueeze(0).to(device)  # (1, L)
     with torch.no_grad():
         out = model(input_ids, use_cache=True)
@@ -44,7 +44,6 @@ def run_scenario(context_ids, offload_to_cpu: bool):
     if offload_to_cpu:
         past = tuple((k.cpu(), v.cpu()) for k, v in past)
 
-    # Measure TTFT
     next_ids = input_ids[:, -1:].contiguous()
     torch.cuda.synchronize(); t0 = time.time()
     with torch.no_grad():
@@ -59,7 +58,6 @@ def run_scenario(context_ids, offload_to_cpu: bool):
     ttft = (time.time() - t0) * 1000.0
     cpu1, gpu1 = measure_mem()
 
-    # Steady‑state throughput
     next_ids = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
     torch.cuda.synchronize(); t0 = time.time()
     for _ in range(num_gen_steps):
@@ -87,10 +85,8 @@ print("-" * 70)
 for L in context_lengths:
     context_ids = all_ids[:L]
 
-    # On‑GPU cache
     ttft, tps, gpu_mem, cpu_mem = run_scenario(context_ids, offload_to_cpu=False)
     print(f"{L:6d} │ {'GPU-cache':>12s} │ {ttft:9.1f} │ {tps:8.1f} │ {gpu_mem:9.2f} │ {cpu_mem:9.2f}")
 
-    # Offload cache
     ttft, tps, gpu_mem, cpu_mem = run_scenario(context_ids, offload_to_cpu=True)
     print(f"{L:6d} │ {'DRAM-offload':>12s} │ {ttft:9.1f} │ {tps:8.1f} │ {gpu_mem:9.2f} │ {cpu_mem:9.2f}")
