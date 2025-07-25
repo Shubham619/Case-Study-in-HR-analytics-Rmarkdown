@@ -1,4 +1,3 @@
-
 import torch
 import time
 import psutil
@@ -7,98 +6,74 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
 model_name      = "openlm-research/open_llama_7b_v2"
-device          = "cuda"
+device          = "cuda:0"
 context_lengths = [512, 1024, 2048]
-num_gen_steps   = 50
+num_gen_steps   = 50   # steady‑state tokens to generate
 
 # ─── SETUP ─────────────────────────────────────────────────────────────────
 tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
-model     = AutoModelForCausalLM.from_pretrained(
-    model_name,
-    torch_dtype=torch.float16,
-    device_map="auto"
-).eval()
-
+model     = (AutoModelForCausalLM
+             .from_pretrained(model_name, torch_dtype=torch.float16)
+             .to(device)
+             .eval())
 process = psutil.Process()
 
 def measure_mem():
+    """Return (cpu_rss_GiB, gpu_reserved_GiB)."""
     cpu = process.memory_info().rss / (1024**3)
     gpu = torch.cuda.memory_reserved(device) / (1024**3)
     return cpu, gpu
 
-# Prepare real text corpus
-ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
-full_text = "\n\n".join(ds["text"])
-enc = tokenizer(full_text, return_tensors="pt")
-all_ids = enc.input_ids[0]
+# ─── PREPARE REAL CONTEXT ───────────────────────────────────────────────────
+ds       = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
+full_txt = "\n\n".join(ds["text"])
+enc      = tokenizer(full_txt, return_tensors="pt")
+all_ids  = enc.input_ids[0]  # long stream of tokens
 
-def run_scenario(context_ids, offload_to_cpu: bool):
-    torch.cuda.reset_peak_memory_stats(device)
+# ─── OFFLOAD BENCHMARK ──────────────────────────────────────────────────────
+print(f"{'CtxLen':>6s} │ {'TTFT(ms)':>9s} │ {'TPS':>8s} │ {'GPU(GiB)':>9s} │ {'CPU(GiB)':>9s}")
+print("-" * 60)
+for L in context_lengths:
+    # 1) build prompt of length L
+    ctx_ids   = all_ids[:L].unsqueeze(0).to(device)
 
-    # 1) FIRST FORWARD: no cache passed in at all
-    input_ids = context_ids.unsqueeze(0).to(device)
+    # --- warm‑up (no cache passed) ---
     with torch.no_grad():
-        out = model(input_ids, use_cache=True)
-    past = out.past_key_values  # here we first capture the cache object
+        out  = model(ctx_ids, use_cache=True)
+    past = out.past_key_values                # cache lives on GPU
+    # immediately offload it to DRAM
+    past = tuple((k.cpu(), v.cpu()) for k, v in past)
 
-    # Optionally move cache to CPU immediately
-    if offload_to_cpu:
-        past = tuple((k.cpu(), v.cpu()) for k, v in past)
-
-    # 2) Measure TTFT (first new token)
-    next_ids = input_ids[:, -1:].contiguous()
+    # --- TTFT measurement ---
+    next_ids = ctx_ids[:, -1:].contiguous()
     torch.cuda.synchronize(); t0 = time.time()
-
     with torch.no_grad():
-        if offload_to_cpu:
-            # bring cache back, forward, then offload again
-            pg = tuple((k.cuda(), v.cuda()) for k, v in past)
-            out = model(next_ids, past_key_values=pg, use_cache=True)
-            past = tuple((k.cpu(), v.cpu()) for k, v in out.past_key_values)
-        else:
-            out = model(next_ids, past_key_values=past, use_cache=True)
-            past = out.past_key_values
-
+        # bring cache to GPU
+        past_gpu = tuple((k.to(device), v.to(device)) for k, v in past)
+        out      = model(next_ids, past_key_values=past_gpu, use_cache=True)
+        # offload again
+        past     = tuple((k.cpu(), v.cpu()) for k, v in out.past_key_values)
     torch.cuda.synchronize()
-    ttft = (time.time() - t0) * 1000.0
+    ttft      = (time.time() - t0) * 1000.0
     cpu1, gpu1 = measure_mem()
 
-    # 3) Steady‑state throughput
+    # --- steady‑state throughput ---
     next_ids = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
     torch.cuda.synchronize(); t0 = time.time()
-
     for _ in range(num_gen_steps):
         with torch.no_grad():
-            if offload_to_cpu:
-                pg = tuple((k.cuda(), v.cuda()) for k, v in past)
-                out = model(next_ids, past_key_values=pg, use_cache=True)
-                past = tuple((k.cpu(), v.cpu()) for k, v in out.past_key_values)
-            else:
-                out = model(next_ids, past_key_values=past, use_cache=True)
-                past = out.past_key_values
-
+            past_gpu = tuple((k.to(device), v.to(device)) for k, v in past)
+            out      = model(next_ids, past_key_values=past_gpu, use_cache=True)
+            past     = tuple((k.cpu(), v.cpu()) for k, v in out.past_key_values)
         next_ids = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
-
     torch.cuda.synchronize()
-    duration = time.time() - t0
-    throughput = num_gen_steps / duration
+    duration  = time.time() - t0
+    tps       = num_gen_steps / duration
     cpu2, gpu2 = measure_mem()
 
     peak_cpu = max(cpu1, cpu2)
     peak_gpu = torch.cuda.max_memory_reserved(device) / (1024**3)
 
-    return ttft, throughput, peak_gpu, peak_cpu
+    print(f"{L:6d} │ {ttft:9.1f} │ {tps:8.1f} │ {peak_gpu:9.2f} │ {peak_cpu:9.2f}")
 
-# ─── RUN BENCHMARK ─────────────────────────────────────────────────────────
-print(f"{'CtxLen':>6s} │ {'Mode':>12s} │ {'TTFT(ms)':>9s} │ {'TPS':>8s} │ {'GPU(GiB)':>9s} │ {'CPU(GiB)':>9s}")
-print("-" * 70)
-for L in context_lengths:
-    ctx = all_ids[:L]
 
-    # On‑GPU cache
-    ttft, tps, gmem, cmem = run_scenario(ctx, offload_to_cpu=False)
-    print(f"{L:6d} │ {'GPU-cache':>12s} │ {ttft:9.1f} │ {tps:8.1f} │ {gmem:9.2f} │ {cmem:9.2f}")
-
-    # DRAM‑offload cache
-    ttft, tps, gmem, cmem = run_scenario(ctx, offload_to_cpu=True)
-    print(f"{L:6d} │ {'DRAM-offload':>12s} │ {ttft:9.1f} │ {tps:8.1f} │ {gmem:9.2f} │ {cmem:9.2f}")
