@@ -5,13 +5,12 @@ import psutil
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-# ─── CONFIG ────────────────────────────────────────────────────────────────
 model_name     = "openlm-research/open_llama_7b_v2"
 device         = "cuda"
 context_lengths = [512, 1024, 2048]  # tokens
 num_gen_steps  = 50   # steady‑state steps
 
-# ─── LOAD MODEL + TOKENIZER ───────────────────────────────────────────────
+
 tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
 model     = AutoModelForCausalLM.from_pretrained(
     model_name,
@@ -27,8 +26,7 @@ def measure_mem():
     gpu = torch.cuda.memory_reserved(device) / (1024**3)
     return cpu, gpu
 
-# ─── PREPARE REAL CONTEXT ─────────────────────────────────────────────────
-# Load the first split of WikiText‑2 and concatenate until we exceed the max length
+
 ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 full_text = "\n\n".join(ds["text"])
 enc = tokenizer(full_text, return_tensors="pt")
@@ -84,7 +82,6 @@ def run_scenario(context_ids, offload_to_cpu: bool):
 
     return ttft, throughput, peak_gpu, peak_cpu
 
-# ─── MAIN BENCHMARK LOOP ──────────────────────────────────────────────────
 print(f"{'CtxLen':>6s} │ {'Mode':>12s} │ {'TTFT(ms)':>9s} │ {'TPS':>8s} │ {'GPU(GiB)':>9s} │ {'CPU(GiB)':>9s}")
 print("-" * 70)
 for L in context_lengths:
