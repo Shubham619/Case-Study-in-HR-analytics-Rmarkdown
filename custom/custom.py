@@ -1,3 +1,4 @@
+
 import torch
 import time
 import psutil
@@ -5,12 +6,12 @@ from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 # ─── CONFIG ────────────────────────────────────────────────────────────────
-model_name     = "openlm-research/open_llama_7b_v2"
-device         = "cuda"
-context_lengths = [512, 1024, 2048]  # tokens
-num_gen_steps  = 50   # steady‑state steps
+model_name      = "openlm-research/open_llama_7b_v2"
+device          = "cuda"
+context_lengths = [512, 1024, 2048]
+num_gen_steps   = 50
 
-# ─── LOAD MODEL + TOKENIZER ───────────────────────────────────────────────
+# ─── SETUP ─────────────────────────────────────────────────────────────────
 tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
 model     = AutoModelForCausalLM.from_pretrained(
     model_name,
@@ -21,48 +22,51 @@ model     = AutoModelForCausalLM.from_pretrained(
 process = psutil.Process()
 
 def measure_mem():
-    """Return (cpu_rss_GiB, gpu_reserved_GiB)."""
     cpu = process.memory_info().rss / (1024**3)
     gpu = torch.cuda.memory_reserved(device) / (1024**3)
     return cpu, gpu
 
-# ─── PREPARE REAL CONTEXT ─────────────────────────────────────────────────
-# Load the first split of WikiText‑2 and concatenate until we exceed the max length
+# Prepare real text corpus
 ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="train")
 full_text = "\n\n".join(ds["text"])
 enc = tokenizer(full_text, return_tensors="pt")
-all_ids = enc.input_ids[0]  # (N_total,)
-print(f"Loaded real text with {all_ids.size(0)} tokens.")
+all_ids = enc.input_ids[0]
 
 def run_scenario(context_ids, offload_to_cpu: bool):
     torch.cuda.reset_peak_memory_stats(device)
-    # Warm up
-    input_ids = context_ids.unsqueeze(0).to(device)  # (1, L)
+
+    # 1) FIRST FORWARD: no cache passed in at all
+    input_ids = context_ids.unsqueeze(0).to(device)
     with torch.no_grad():
         out = model(input_ids, use_cache=True)
-        past = out.past_key_values
+    past = out.past_key_values  # here we first capture the cache object
 
+    # Optionally move cache to CPU immediately
     if offload_to_cpu:
         past = tuple((k.cpu(), v.cpu()) for k, v in past)
 
-    # Measure TTFT
+    # 2) Measure TTFT (first new token)
     next_ids = input_ids[:, -1:].contiguous()
     torch.cuda.synchronize(); t0 = time.time()
+
     with torch.no_grad():
         if offload_to_cpu:
+            # bring cache back, forward, then offload again
             pg = tuple((k.cuda(), v.cuda()) for k, v in past)
             out = model(next_ids, past_key_values=pg, use_cache=True)
             past = tuple((k.cpu(), v.cpu()) for k, v in out.past_key_values)
         else:
             out = model(next_ids, past_key_values=past, use_cache=True)
             past = out.past_key_values
+
     torch.cuda.synchronize()
     ttft = (time.time() - t0) * 1000.0
     cpu1, gpu1 = measure_mem()
 
-    # Steady‑state throughput
+    # 3) Steady‑state throughput
     next_ids = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
     torch.cuda.synchronize(); t0 = time.time()
+
     for _ in range(num_gen_steps):
         with torch.no_grad():
             if offload_to_cpu:
@@ -72,7 +76,9 @@ def run_scenario(context_ids, offload_to_cpu: bool):
             else:
                 out = model(next_ids, past_key_values=past, use_cache=True)
                 past = out.past_key_values
+
         next_ids = torch.argmax(out.logits[:, -1, :], dim=-1, keepdim=True)
+
     torch.cuda.synchronize()
     duration = time.time() - t0
     throughput = num_gen_steps / duration
@@ -83,16 +89,16 @@ def run_scenario(context_ids, offload_to_cpu: bool):
 
     return ttft, throughput, peak_gpu, peak_cpu
 
-# ─── MAIN BENCHMARK LOOP ──────────────────────────────────────────────────
+# ─── RUN BENCHMARK ─────────────────────────────────────────────────────────
 print(f"{'CtxLen':>6s} │ {'Mode':>12s} │ {'TTFT(ms)':>9s} │ {'TPS':>8s} │ {'GPU(GiB)':>9s} │ {'CPU(GiB)':>9s}")
 print("-" * 70)
 for L in context_lengths:
-    context_ids = all_ids[:L]
+    ctx = all_ids[:L]
 
     # On‑GPU cache
-    ttft, tps, gpu_mem, cpu_mem = run_scenario(context_ids, offload_to_cpu=False)
-    print(f"{L:6d} │ {'GPU-cache':>12s} │ {ttft:9.1f} │ {tps:8.1f} │ {gpu_mem:9.2f} │ {cpu_mem:9.2f}")
+    ttft, tps, gmem, cmem = run_scenario(ctx, offload_to_cpu=False)
+    print(f"{L:6d} │ {'GPU-cache':>12s} │ {ttft:9.1f} │ {tps:8.1f} │ {gmem:9.2f} │ {cmem:9.2f}")
 
-    # Offload cache
-    ttft, tps, gpu_mem, cpu_mem = run_scenario(context_ids, offload_to_cpu=True)
-    print(f"{L:6d} │ {'DRAM-offload':>12s} │ {ttft:9.1f} │ {tps:8.1f} │ {gpu_mem:9.2f} │ {cpu_mem:9.2f}")
+    # DRAM‑offload cache
+    ttft, tps, gmem, cmem = run_scenario(ctx, offload_to_cpu=True)
+    print(f"{L:6d} │ {'DRAM-offload':>12s} │ {ttft:9.1f} │ {tps:8.1f} │ {gmem:9.2f} │ {cmem:9.2f}")
