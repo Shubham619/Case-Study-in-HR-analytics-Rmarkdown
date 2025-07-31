@@ -90,3 +90,65 @@ for L in context_lengths:
 
     ttft, tps, gpu_mem, cpu_mem = run_scenario(context_ids, offload_to_cpu=True)
     print(f"{L:6d} │ {'DRAM-offload':>12s} │ {ttft:9.1f} │ {tps:8.1f} │ {gpu_mem:9.2f} │ {cpu_mem:9.2f}")
+
+
+
+
+
+# 1) locate the first PtiConfig.cmake under ~/local (or anywhere in $HOME)
+PTI_CONFIG=$(find $HOME -type f -iname PtiConfig.cmake | head -n1)
+[ -z "$PTI_CONFIG" ] && { echo "❌ PtiConfig.cmake not found – build/install Pti first"; exit 1; }
+
+# 2) derive the install prefix (two levels up from the file)
+PTI_PREFIX=$(dirname $(dirname "$PTI_CONFIG"))
+
+# 3) one-line install with GPU
+CUDA_HOME=/usr/local/cuda \
+CUDACXX=$CUDA_HOME/bin/nvcc \
+CMAKE_PREFIX_PATH="$CUDA_HOME:$PTI_PREFIX:$CMAKE_PREFIX_PATH" \
+python3 setup.py install -- \
+  -DUSE_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release
+# 1) find your PTI install prefix (if you have PtiConfig.cmake anywhere under $HOME)
+PTI_PREFIX=$(dirname "$(dirname "$(find $HOME -type f -iname PtiConfig.cmake 2>/dev/null | head -n1)")")
+
+# 2) set CUDA and NVCC
+CUDA_HOME=/usr/local/cuda
+CUDACXX=$CUDA_HOME/bin/nvcc
+
+# 3) build & install in one shot with GPU
+CMAKE_PREFIX_PATH="$CUDA_HOME${PTI_PREFIX:+:$PTI_PREFIX}:$CMAKE_PREFIX_PATH" \
+python3 setup.py install -- \
+  -DUSE_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release
+sudo apt update
+sudo apt install -y \
+  build-essential cmake git curl \
+  python3-dev python3-pip python3-venv \
+  libopenblas-dev libblas-dev liblapack-dev \
+  ninja-build libgflags-dev libgoogle-glog-dev \
+  libomp-dev
+cd ~/src/pytorch
+# clean up any prior build
+rm -rf build/
+
+# set up CUDA and optional Pti prefix (if you have PTIConfig.cmake installed)
+CUDA_HOME=/usr/local/cuda
+CUDACXX=$CUDA_HOME/bin/nvcc
+
+# (optional) auto-discover your Pti install under $HOME
+PTI_CFG=$(find $HOME -type f -iname PtiConfig.cmake 2>/dev/null | head -n1)
+if [ -n "$PTI_CFG" ]; then
+  PTI_PREFIX=$(dirname "$(dirname "$PTI_CFG")")
+  CMAKE_PREFIX_PATH="$CUDA_HOME:$PTI_PREFIX:$CMAKE_PREFIX_PATH"
+else
+  CMAKE_PREFIX_PATH="$CUDA_HOME:$CMAKE_PREFIX_PATH"
+fi
+
+# final one-liner to build & install
+CUDACXX=$CUDACXX \
+CMAKE_PREFIX_PATH=$CMAKE_PREFIX_PATH \
+python3 setup.py clean --all install -- \
+  -DUSE_CUDA=ON \
+  -DCMAKE_BUILD_TYPE=Release
+
