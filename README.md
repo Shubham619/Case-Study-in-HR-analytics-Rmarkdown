@@ -1,3 +1,11 @@
+python3 setup.py install -- \
+  -DCMAKE_C_COMPILER=$(which gcc) \
+  -DCMAKE_CXX_COMPILER=$(which g++) \
+  -DCMAKE_CUDA_COMPILER=$(which nvcc) \
+  -DCUDA_TOOLKIT_ROOT_DIR=$CUDA_HOME \
+  -DUSE_CUDA=ON \
+  -DUSE_SYSTEM_NVTX=ON \
+  -DCMAKE_BUILD_TYPE=Release
 
 import torch
 import time
