@@ -15,3 +15,30 @@ export CMAKE_ARGS="\
 
 sudo python3 setup.py clean
 sudo python3 setup.py install
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# Replace with your actual model name (e.g., 'deepseek-ai/deepseek-llm-7b-base')
+model_name = "deepseek-ai/deepseek-llm-7b-base"
+model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float16).cuda()
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+def inspect_cache(prompt: str):
+    input_ids = tokenizer(prompt, return_tensors="pt").input_ids.cuda()
+    with torch.no_grad():
+        output = model(input_ids, use_cache=True)
+        past_key_values = output.past_key_values  # Tuple of layers -> tuple(key, value)
+
+    print(f"Prompt token length: {input_ids.shape[1]}")
+    total = 0
+    for l, layer in enumerate(past_key_values):
+        for t in layer:
+            size = t.element_size() * t.numel()
+            total += size
+        print(f"Layer {l} Key shape: {layer[0].shape}, Value shape: {layer[1].shape}")
+    print(f"Total KV Cache Size: {total / 1024 / 1024:.2f} MB\n")
+
+# Test with increasing prompt length
+for n in [5, 10, 20, 40]:
+    prompt = "Hello world! " * n
+    inspect_cache(prompt)
