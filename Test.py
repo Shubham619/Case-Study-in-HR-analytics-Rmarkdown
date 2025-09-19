@@ -69,6 +69,36 @@ outputs = model.generate(
 # Decode final text
 print("Generated text:", tokenizer.decode(outputs[0], skip_special_tokens=True))
 
+import numpy as np
+import torch
+from transformers.cache_utils import StaticCache
 
+class NUMAStaticCache(StaticCache):
+    def __init__(self, *args, node=1, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.node = node
+
+    def allocate(self, shape, dtype, device):
+        # Map torch dtype → numpy dtype
+        if dtype == torch.float32:
+            np_dtype = np.float32
+        elif dtype == torch.float16:
+            np_dtype = np.float16
+        else:
+            np_dtype = np.float32  # fallback
+
+        # --- inline use of your alloc_on_node ---
+        np_dtype = np.dtype(np_dtype)
+        nbytes = int(np.prod(shape)) * np_dtype.itemsize
+        libnuma.numa_set_strict(1)
+        ptr = libnuma.numa_alloc_onnode(nbytes, int(self.node))
+        if not ptr:
+            raise MemoryError(f"numa_alloc_onnode failed for {nbytes} bytes on node {self.node}")
+
+        base = (ctypes.c_uint8 * nbytes).from_address(ptr)
+        arr = np.frombuffer(base, dtype=np_dtype, count=int(np.prod(shape))).reshape(shape)
+
+        # Wrap numpy array into torch tensor
+        return torch.from_numpy(arr).to(dtype)
 
 
