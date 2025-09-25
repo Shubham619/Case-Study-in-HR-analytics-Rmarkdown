@@ -56,7 +56,7 @@ def build_target_cache_on_numa(model, batch_size, target_max_len):
     )
     return cache
 
-def offload_from_warmup_to_numa(target_cache, warmup_cache, prompt_len, node_id=1):
+def offload_from_warmup_to_numa(target_cache, warmup_cache, prompt_len, model_config, node_id=1):
     """
     Creates NUMA-backed tensors for the target cache and copies data from the
     warm-up cache into them.
@@ -65,7 +65,8 @@ def offload_from_warmup_to_numa(target_cache, warmup_cache, prompt_len, node_id=
 
     # Get head_dim from the model config
     try:
-        head_dim = target_cache.config.hidden_size // target_cache.config.num_attention_heads
+        head_dim = model_config.hidden_size // model_config.num_attention_heads
+        num_attention_heads = model_config.num_attention_heads
     except AttributeError:
         raise AttributeError("Could not determine head dimension from model config. Check for `hidden_size` and `num_attention_heads`.")
 
@@ -77,7 +78,7 @@ def offload_from_warmup_to_numa(target_cache, warmup_cache, prompt_len, node_id=
         v_dtype = v_src.dtype
 
         full_shape = (target_cache.max_batch_size, 
-                      target_cache.config.num_attention_heads, 
+                      num_attention_heads, 
                       target_cache.max_cache_len, 
                       head_dim)
         
@@ -177,6 +178,7 @@ if __name__ == "__main__":
                 target_cache=target_cache,
                 warmup_cache=warmup_cache,
                 prompt_len=prompt_len,
+                model_config=model.config,  # Pass model config explicitly
                 node_id=numa_node
             )
 
