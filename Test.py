@@ -324,3 +324,124 @@ out = model.generate(
 print(tok.decode(out[0]))
 
 
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers.cache_utils import StaticCache
+
+import ctypes, numpy as np
+
+# ---------------- NUMA helper ---------------- #
+libnuma = ctypes.CDLL("libnuma.so.1")
+libnuma.numa_available.restype = ctypes.c_int
+libnuma.numa_alloc_onnode.argtypes = [ctypes.c_size_t, ctypes.c_int]
+libnuma.numa_alloc_onnode.restype  = ctypes.c_void_p
+libnuma.numa_free.argtypes         = [ctypes.c_void_p, ctypes.c_size_t]
+
+if libnuma.numa_available() < 0:
+    raise RuntimeError("NUMA not available on this system")
+
+_TORCH2NP = {
+    torch.float32: np.float32,
+    torch.float16: np.float16,
+    torch.bfloat16: np.float16,   # fallback: store as fp16, view back
+    torch.int8: np.int8,
+    torch.int16: np.int16,
+    torch.int32: np.int32,
+    torch.int64: np.int64,
+    torch.uint8: np.uint8,
+}
+
+def _to_numpy_dtype(t_dtype: torch.dtype):
+    return _TORCH2NP.get(t_dtype, np.float32)
+
+def _alloc_numpy_on_node(shape, np_dtype, node: int):
+    nbytes = int(np.prod(shape)) * np.dtype(np_dtype).itemsize
+    ptr = libnuma.numa_alloc_onnode(nbytes, int(node))
+    if not ptr:
+        raise MemoryError(f"numa_alloc_onnode failed for {nbytes} bytes on node {node}")
+    buf = (ctypes.c_uint8 * nbytes).from_address(ptr)
+    np_arr = np.frombuffer(buf, dtype=np_dtype, count=int(np.prod(shape))).reshape(shape)
+    def _free(): libnuma.numa_free(ptr, nbytes)
+    return np_arr, ptr, _free
+
+def _ensure_list(x):
+    return x if isinstance(x, list) else [x]
+
+def _same_container_type(old, new_list):
+    if isinstance(old, list):
+        return new_list
+    assert len(new_list) == 1
+    return new_list[0]
+
+def rehome_static_kv_cache_to_node(kv_cache, node: int = 1):
+    numa_ptrs, free_fns = [], []
+
+    def rehome_one_container(container):
+        new_tensors = []
+        for t in _ensure_list(container):
+            if t is None:   # leave None entries intact
+                new_tensors.append(None)
+                continue
+
+            src = t.detach().to("cpu").contiguous()
+            shape = tuple(src.shape)
+            np_dtype = _to_numpy_dtype(src.dtype)
+
+            np_arr, ptr, free_fn = _alloc_numpy_on_node(shape, np_dtype, node)
+            np.copyto(np_arr, src.numpy(), casting="no")
+
+            new_t = torch.from_numpy(np_arr)
+            new_t.requires_grad = False
+            if new_t.dtype != src.dtype:
+                new_t = new_t.view(dtype=src.dtype)
+
+            new_tensors.append(new_t)
+            numa_ptrs.append((ptr, np_arr.nbytes))
+            free_fns.append(free_fn)
+
+        return _same_container_type(container, new_tensors)
+
+    kv_cache.key_cache   = rehome_one_container(kv_cache.key_cache)
+    kv_cache.value_cache = rehome_one_container(kv_cache.value_cache)
+
+    setattr(kv_cache, "_numa_node", int(node))
+    setattr(kv_cache, "_numa_raw_ptrs", numa_ptrs)
+    setattr(kv_cache, "free_numa_cache", lambda: [fn() for fn in free_fns])
+    return kv_cache
+# ------------------------------------------------ #
+
+# 1. Load model & tokenizer
+model_id = "gpt2"   # or your larger model
+tok = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float32)
+model.eval()
+
+# 2. Build a StaticCache
+prompt = "DeepSeek is transforming inference efficiency."
+inputs = tok(prompt, return_tensors="pt")
+
+kv_cache = StaticCache(
+    max_batch_size=inputs.input_ids.shape[0],
+    max_cache_len=128,
+    config=model.config
+)
+
+# 3. Warm-up forward pass so cache fills
+with torch.no_grad():
+    _ = model(**inputs, past_key_values=kv_cache)
+
+print("Before rehome:", kv_cache.key_cache[0] is None)  # should now be False
+
+# 4. Re-home to NUMA node 1
+rehome_static_kv_cache_to_node(kv_cache, node=1)
+
+# 5. Continue generation with NUMA-backed cache
+out = model.generate(
+    **inputs,
+    past_key_values=kv_cache,
+    max_new_tokens=50
+)
+
+print(tok.decode(out[0]))
+
+
