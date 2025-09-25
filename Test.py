@@ -1,4 +1,45 @@
-# In your `build_target_cache_on_numa` function, modify it as follows:
+# In your `if __name__ == "__main__":` block,
+# replace the `out = model.generate(...)` call.
+
+# 3) Generate using a standard tuple of tuples, providing attention_mask and position_ids
+# First, create the tuple format that the model expects
+numa_past_key_values = tuple(
+    (target_cache.key_cache[i], target_cache.value_cache[i])
+    for i in range(len(target_cache.key_cache))
+)
+
+# Get the length of the initial prompt
+current_length = inputs.input_ids.shape[1]
+
+# Manually create a new attention mask and position ids for the first generation step
+attention_mask = torch.ones(
+    inputs.input_ids.shape[0], # batch_size
+    current_length,
+    dtype=torch.long,
+    device=inputs.input_ids.device
+)
+
+position_ids = torch.arange(
+    0, 
+    current_length, 
+    dtype=torch.long, 
+    device=inputs.input_ids.device
+).unsqueeze(0)
+
+# The model will use these to correctly determine the past length
+out = model.generate(
+    input_ids=inputs.input_ids,
+    past_key_values=numa_past_key_values,
+    attention_mask=attention_mask,
+    position_ids=position_ids,
+    max_new_tokens=64,
+    use_cache=True
+)
+
+print(tok.decode(out[0]))
+
+
+m# In your `build_target_cache_on_numa` function, modify it as follows:
 # In your `if __name__ == "__main__":` block,
 # replace the `out = model.generate(...)` call.
 # In your `if __name__ == "__main__":` block,
