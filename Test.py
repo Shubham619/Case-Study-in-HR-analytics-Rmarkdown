@@ -18,7 +18,6 @@ except OSError:
     exit()
 
 def torch_dtype_to_numpy(dtype):
-    """Converts a torch dtype to a numpy dtype."""
     if dtype == torch.float32: return np.float32
     if dtype == torch.float16: return np.float16
     if dtype == torch.bfloat16: return np.float16
@@ -30,7 +29,6 @@ def torch_dtype_to_numpy(dtype):
     raise ValueError(f"Unsupported dtype: {dtype}")
 
 def alloc_numpy_on_node(shape, np_dtype, numa_node):
-    """Allocates a NumPy array on a specific NUMA node using libnuma."""
     nbytes = int(np.prod(shape)) * np.dtype(np_dtype).itemsize
     ptr = libnuma.numa_alloc_onnode(nbytes, int(numa_node))
     if not ptr:
@@ -45,7 +43,6 @@ def alloc_numpy_on_node(shape, np_dtype, numa_node):
 
 # ---------------- Custom Cache Class ----------------
 class NumaKVCache:
-    """Custom KV cache that mimics StaticCache but uses NUMA allocation"""
     def __init__(self, max_batch_size, max_cache_len):
         self.max_batch_size = max_batch_size
         self.max_cache_len = max_cache_len
@@ -64,11 +61,7 @@ class NumaKVCache:
         for fn in self.free_functions:
             fn()
 
-# ---------------- Cache building ----------------
 def build_numa_cache_from_warmup(warmup_cache, batch_size, target_max_len, prompt_len, node_id=1):
-    """
-    Creates a NUMA-backed cache directly from warmup cache
-    """
     numa_cache = NumaKVCache(batch_size, target_max_len)
     
     if len(warmup_cache) == 0:
@@ -145,15 +138,16 @@ if __name__ == "__main__":
     prompt = "DeepSeek is transforming inference efficiency."
     inputs = tok(prompt, return_tensors="pt").to(device)
     
-    # --- Custom Generation Loop ---
     with torch.no_grad():
-        first_output = model(
-            input_ids=inputs.input_ids,
-            use_cache=True,
+        # Step 1: Get the initial key/value pairs for the prompt
+        warmup_output = model(
+            input_ids=inputs.input_ids
         )
         
-        warmup_cache = first_output.past_key_values
+        # Manually create the initial cache tuple from the output
+        warmup_cache = tuple(warmup_output.past_key_values)
         
+        # Step 2: Build the NUMA cache
         batch_size = inputs.input_ids.shape[0]
         prompt_len = inputs.input_ids.shape[1]
         target_max_len = 2048
@@ -169,27 +163,36 @@ if __name__ == "__main__":
 
         generated_ids = inputs.input_ids.tolist()
         
-        next_token_logits = first_output.logits[0, -1, :]
+        # Get the first token
+        next_token_logits = warmup_output.logits[0, -1, :]
         next_token_id = torch.argmax(next_token_logits, dim=-1).item()
         generated_ids[0].append(next_token_id)
         
         current_length = prompt_len + 1
 
+        # Step 3: The manual generation loop
         for _ in range(63):
+            # The input for the next step is only the last generated token
             new_input_ids = torch.tensor([[generated_ids[0][-1]]], dtype=torch.long).to(device)
             
+            # Use the past_key_values from the NUMA cache
             output = model(
                 input_ids=new_input_ids,
-                past_key_values=numa_cache,
-                use_cache=True,
+                past_key_values=numa_cache
             )
             
+            # Get the new key/value tensors for the new token
             new_cache = output.past_key_values
+            
+            # Manually copy the new data into the NUMA cache
             for layer_idx in range(len(new_cache)):
                 new_k, new_v = new_cache[layer_idx]
-                numa_cache.key_cache[layer_idx][:, :, current_length, :] = new_k
-                numa_cache.value_cache[layer_idx][:, :, current_length, :] = new_v
-            
+                
+                # Check for bounds to prevent errors
+                if current_length < numa_cache.max_cache_len:
+                    numa_cache.key_cache[layer_idx][:, :, current_length, :].copy_(new_k)
+                    numa_cache.value_cache[layer_idx][:, :, current_length, :].copy_(new_v)
+
             next_token_logits = output.logits[0, -1, :]
             next_token_id = torch.argmax(next_token_logits, dim=-1).item()
             generated_ids[0].append(next_token_id)
