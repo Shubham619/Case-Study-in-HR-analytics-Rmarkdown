@@ -1,4 +1,97 @@
 # In your `if __name__ == "__main__":` block,
+# replace the `model.generate(...)` call with this custom loop.
+
+# --- Custom Generation Loop ---
+# 1. Prepare initial inputs
+input_ids = inputs.input_ids
+current_length = input_ids.shape[1]
+generated_ids = input_ids.tolist()
+
+# 2. Get the first token's output to set up the cache
+with torch.no_grad():
+    first_output = model(
+        input_ids=input_ids,
+        use_cache=True,
+    )
+    # The cache is now populated with the prompt's key-values
+    # Note: `first_output.past_key_values` is in the standard format,
+    # so we can use it to get the correct length and types.
+    past_key_values = first_output.past_key_values
+
+    # Get the next token to start the generation
+    next_token_logits = first_output.logits[0, -1, :]
+    next_token_id = torch.argmax(next_token_logits, dim=-1).item()
+    generated_ids[0].append(next_token_id)
+    
+    # 3. Offload the cache to NUMA
+    target_max_len = 2048
+    numa_node = 1
+    target_cache = build_target_cache_on_numa(model, batch_size, target_max_len, numa_node)
+    
+    # Use the populated past_key_values for offloading
+    target_cache = offload_from_warmup_to_numa(
+        target_cache=target_cache,
+        warmup_cache=past_key_values,
+        prompt_len=current_length,
+        node_id=numa_node
+    )
+
+    # 4. Enter the generation loop
+    for _ in range(63): # Generate 63 new tokens (total 64)
+        # Get the latest token to be used as input
+        new_input_ids = torch.tensor([[generated_ids[0][-1]]], dtype=torch.long).to(input_ids.device)
+        
+        # Calculate the new current length
+        current_length += 1
+        
+        # Manually create attention_mask and position_ids
+        attention_mask = torch.ones(
+            new_input_ids.shape[0], current_length, dtype=torch.long, device=input_ids.device
+        )
+        position_ids = torch.tensor(
+            [[current_length - 1]], dtype=torch.long, device=input_ids.device
+        )
+
+        output = model(
+            input_ids=new_input_ids,
+            past_key_values=target_cache, # Pass our NUMA-backed cache
+            attention_mask=attention_mask,
+            position_ids=position_ids,
+            use_cache=True,
+        )
+
+        # Get the next token
+        next_token_logits = output.logits[0, -1, :]
+        next_token_id = torch.argmax(next_token_logits, dim=-1).item()
+        generated_ids[0].append(next_token_id)
+        
+        # Update the past_key_values with the new one from the model's output
+        # (This is where the cache is updated in the custom loop)
+        target_cache = output.past_key_values
+
+
+# 5. Decode the final result
+final_output = tok.decode(generated_ids[0])
+print(final_output)
+
+# 6. (Optional) Free NUMA pages when done
+if hasattr(target_cache, "free_numa"):
+    target_cache.free_numa()
+    del target_cache
+    gc.collect()
+
+
+
+
+
+
+
+
+
+
+
+
+# In your `if __name__ == "__main__":` block,
 # replace the `out = model.generate(...)` call.
 
 # 3) Generate using a standard tuple of tuples, providing attention_mask and position_ids
