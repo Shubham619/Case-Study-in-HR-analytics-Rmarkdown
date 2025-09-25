@@ -67,20 +67,18 @@ class NumaKVCache:
 # ---------------- Cache building ----------------
 def build_numa_cache_from_warmup(warmup_cache, batch_size, target_max_len, prompt_len, node_id=1):
     """
-    Creates a NUMA-backed cache directly from warmup cache without using StaticCache
+    Creates a NUMA-backed cache directly from warmup cache
     """
     numa_cache = NumaKVCache(batch_size, target_max_len)
     
     if len(warmup_cache) == 0:
         raise ValueError("Warmup cache is empty")
     
-    # Get shape information from the first layer's tensors
     k_sample, v_sample = warmup_cache[0]
     batch_size_actual, num_heads, seq_len, head_dim = k_sample.shape
     
     print(f"Detected cache shape: batch={batch_size_actual}, heads={num_heads}, seq_len={seq_len}, head_dim={head_dim}")
 
-    # Iterate through all layers, creating a NUMA-backed tensor for each one
     for i in range(len(warmup_cache)):
         k_src, v_src = warmup_cache[i]
         
@@ -96,7 +94,7 @@ def build_numa_cache_from_warmup(warmup_cache, batch_size, target_max_len, promp
             np_k, free_k = alloc_numpy_on_node(full_shape, np_k_dtype, node_id)
             np_v, free_v = alloc_numpy_on_node(full_shape, np_v_dtype, node_id)
         except MemoryError as e:
-            print(f"Failed to allocate memory for layer {i} on NUMA node {node_id}: {e}")
+            print(f"Failed to allocate memory for layer {i} on NUMA node {numa_node}: {e}")
             numa_cache.free_numa()
             raise e
 
@@ -106,7 +104,6 @@ def build_numa_cache_from_warmup(warmup_cache, batch_size, target_max_len, promp
         k_src_cpu = k_src.detach().to("cpu").contiguous().numpy()
         v_src_cpu = v_src.detach().to("cpu").contiguous().numpy()
         
-        # Copy only the prompt portion
         np_k[:, :, :prompt_len, :] = k_src_cpu
         np_v[:, :, :prompt_len, :] = v_src_cpu
         
@@ -131,11 +128,15 @@ if __name__ == "__main__":
     torch.set_grad_enabled(False)
     torch.set_default_dtype(torch.float32)
     
-    model_id = "deepseek-ai/deepseek-moe-16b-base"
+    model_id = "./deepseek_moe_16b_base"
     device = "cpu"
 
-    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
+    tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,
+        trust_remote_code=True
+    )
     model.to(device)
     model.eval()
 
@@ -145,7 +146,6 @@ if __name__ == "__main__":
     inputs = tok(prompt, return_tensors="pt").to(device)
     
     # --- Custom Generation Loop ---
-    # 1. Get the first token's output to set up the cache
     with torch.no_grad():
         first_output = model(
             input_ids=inputs.input_ids,
@@ -169,14 +169,12 @@ if __name__ == "__main__":
 
         generated_ids = inputs.input_ids.tolist()
         
-        # The first output already generated the first token, so we update the generated IDs.
         next_token_logits = first_output.logits[0, -1, :]
         next_token_id = torch.argmax(next_token_logits, dim=-1).item()
         generated_ids[0].append(next_token_id)
         
         current_length = prompt_len + 1
 
-        # 2. Enter the generation loop to produce the remaining tokens
         for _ in range(63):
             new_input_ids = torch.tensor([[generated_ids[0][-1]]], dtype=torch.long).to(device)
             
@@ -186,7 +184,6 @@ if __name__ == "__main__":
                 use_cache=True,
             )
             
-            # Manually update the NumaKVCache with the new key/value pairs
             new_cache = output.past_key_values
             for layer_idx in range(len(new_cache)):
                 new_k, new_v = new_cache[layer_idx]
