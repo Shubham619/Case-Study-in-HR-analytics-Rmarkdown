@@ -1,3 +1,180 @@
+import os, gc, ctypes
+import numpy as np
+import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers.cache_utils import StaticCache
+
+# ---------------- NUMA helpers ----------------
+libnuma = ctypes.CDLL("libnuma.so.1")
+libnuma.numa_available.restype = ctypes.c_int
+libnuma.numa_alloc_onnode.argtypes = [ctypes.c_size_t, ctypes.c_int]
+libnuma.numa_alloc_onnode.restype  = ctypes.c_void_p
+libnuma.numa_free.argtypes         = [ctypes.c_void_p, ctypes.c_size_t]
+
+if libnuma.numa_available() < 0:
+    raise RuntimeError("NUMA not available on this system")
+
+def torch_dtype_to_numpy(dtype):
+    if dtype == torch.float32: return np.float32
+    if dtype == torch.float16: return np.float16
+    if dtype == torch.bfloat16: return np.float16  # store as fp16; we'll cast back to bfloat16 in Torch
+    if dtype == torch.int64:   return np.int64
+    if dtype == torch.int32:   return np.int32
+    if dtype == torch.int16:   return np.int16
+    if dtype == torch.int8:    return np.int8
+    if dtype == torch.uint8:   return np.uint8
+    raise ValueError(f"Unsupported dtype: {dtype}")
+
+def alloc_numpy_on_node(shape, np_dtype, numa_node):
+    nbytes = int(np.prod(shape)) * np.dtype(np_dtype).itemsize
+    ptr = libnuma.numa_alloc_onnode(nbytes, int(numa_node))
+    if not ptr:
+        raise MemoryError(f"numa_alloc_onnode failed for {nbytes} bytes on node {numa_node}")
+    buf = (ctypes.c_uint8 * nbytes).from_address(ptr)
+    arr = np.frombuffer(buf, dtype=np_dtype, count=int(np.prod(shape))).reshape(shape)
+    def _free():
+        libnuma.numa_free(ptr, nbytes)
+    return arr, _free
+# ------------------------------------------------
+
+def build_prompt_sized_cache(model, batch_size, prompt_len):
+    # Small cache sized to prompt so HF's StaticCache.update uses copy_ without mismatch
+    return StaticCache(
+        max_batch_size=batch_size,
+        max_cache_len=prompt_len,
+        config=model.config
+    )
+
+def build_target_cache_on_numa(model, batch_size, target_max_len, node_id):
+    # Big cache for actual generation (capacity), to be backed by NUMA node-1 tensors
+    cache = StaticCache(
+        max_batch_size=batch_size,
+        max_cache_len=target_max_len,
+        config=model.config
+    )
+    # Lazily we will replace key/value buffers below
+    return cache
+
+def offload_from_warmup_to_numa(target_cache, warmup_cache, prompt_len, node_id=1):
+    """
+    Create NUMA-backed buffers with full target capacity and copy the warm-up slice [..prompt_len)
+    into them. Replace buffers in target_cache. Drop warmup_cache to avoid a duplicate DDR copy.
+    """
+    new_keys, new_vals, free_fns = [], [], []
+
+    for i, (k_src, v_src) in enumerate(zip(warmup_cache.key_cache, warmup_cache.value_cache)):
+        # Shapes
+        b, h, _, d = k_src.shape
+        full_shape = (b, h, target_cache.max_cache_len, d)
+
+        # Dtypes
+        k_dtype = k_src.dtype
+        v_dtype = v_src.dtype
+        np_k_dtype = torch_dtype_to_numpy(k_dtype)
+        np_v_dtype = torch_dtype_to_numpy(v_dtype)
+
+        # Allocate on NUMA node
+        np_k, free_k = alloc_numpy_on_node(full_shape, np_k_dtype, node_id)
+        np_v, free_v = alloc_numpy_on_node(full_shape, np_v_dtype, node_id)
+
+        # Zero-initialize (optional, but good hygiene)
+        np_k.fill(0)
+        np_v.fill(0)
+
+        # Copy ONLY the filled prompt slice from warm-up cache
+        k_src_cpu = k_src.detach().to("cpu").contiguous().numpy()
+        v_src_cpu = v_src.detach().to("cpu").contiguous().numpy()
+        np_k[..., :prompt_len, :] = k_src_cpu[..., :prompt_len, :]
+        np_v[..., :prompt_len, :] = v_src_cpu[..., :prompt_len, :]
+
+        # Wrap as Torch tensors
+        tk = torch.from_numpy(np_k)
+        tv = torch.from_numpy(np_v)
+        # Cast back to original dtype if needed (not a view; .to will cast data)
+        if tk.dtype != k_dtype: tk = tk.to(k_dtype)
+        if tv.dtype != v_dtype: tv = tv.to(v_dtype)
+        tk.requires_grad = False
+        tv.requires_grad = False
+
+        # Replace buffers in target cache (HF keeps references in _buffers)
+        target_cache._buffers[f"key_cache_{i}"] = tk
+        target_cache._buffers[f"value_cache_{i}"] = tv
+        new_keys.append(tk)
+        new_vals.append(tv)
+
+        free_fns.extend([free_k, free_v])
+
+    target_cache.key_cache = new_keys
+    target_cache.value_cache = new_vals
+
+    # Ensure generate() sees a scalar past length, not None or list
+    def _fixed_seq_length(self):
+        return int(prompt_len)
+    target_cache.get_seq_length = _fixed_seq_length.__get__(target_cache, type(target_cache))
+
+    # attach a manual free
+    target_cache.free_numa = lambda: [fn() for fn in free_fns]
+
+    # Drop warm-up cache (DDR copy) to avoid duplicate memory
+    del warmup_cache
+    gc.collect()
+
+    return target_cache
+
+if __name__ == "__main__":
+    torch.set_grad_enabled(False)
+
+    model_id = "deepseek-ai/deepseek-moe-16b-base"
+    device = "cpu"   # keep model on CPU for this NUMA experiment; adapt as needed
+
+    tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
+    model.to(device)
+    model.eval()
+
+    prompt = "DeepSeek is transforming inference efficiency."
+    inputs = tok(prompt, return_tensors="pt").to(device)
+    batch_size = inputs.input_ids.shape[0]
+    prompt_len = inputs.input_ids.shape[1]
+
+    # 1) Warm-up with cache sized EXACTLY to the prompt (so copy_ branch is safe)
+    warmup_cache = build_prompt_sized_cache(model, batch_size, prompt_len)
+
+    with torch.no_grad():
+        _ = model(**inputs, past_key_values=warmup_cache, use_cache=True)
+
+    # 2) Build target cache with your real max length (e.g., 2048) and offload to NUMA node 1
+    TARGET_MAX_LEN = 2048
+    numa_node = 1
+    target_cache = build_target_cache_on_numa(model, batch_size, TARGET_MAX_LEN, numa_node)
+
+    target_cache = offload_from_warmup_to_numa(
+        target_cache=target_cache,
+        warmup_cache=warmup_cache,
+        prompt_len=prompt_len,
+        node_id=numa_node
+    )
+
+    # 3) Generate using the SAME (NUMA-backed) cache
+    out = model.generate(
+        **inputs,
+        past_key_values=target_cache,
+        max_new_tokens=64,
+        use_cache=True
+    )
+    print(tok.decode(out[0]))
+
+    # 4) (Optional) Free NUMA pages when done
+    if hasattr(target_cache, "free_numa"):
+        target_cache.free_numa()
+        del target_cache
+        gc.collect()
+        
+
+
+
+
+
 def rehome_static_kv_cache_to_node(kv_cache, node=1):
     new_keys, new_vals = [], []
     for i, (k, v) in enumerate(zip(kv_cache.key_cache, kv_cache.value_cache)):
