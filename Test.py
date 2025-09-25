@@ -1,3 +1,79 @@
+# In the `offload_from_warmup_to_numa` function
+# Replace the entire for-loop with the code below.
+
+for i in range(len(target_cache.key_cache)):
+    k_src = warmup_cache.key_cache[i]
+    v_src = warmup_cache.value_cache[i]
+    
+    # Determine the dtype and shape from the model's config, not the source tensor
+    k_dtype = target_cache.key_cache[i].dtype
+    v_dtype = target_cache.value_cache[i].dtype
+
+    full_shape_k = (target_cache.max_batch_size, 
+                    target_cache.config.num_attention_heads, 
+                    target_cache.max_cache_len, 
+                    target_cache.config.head_dim)
+    full_shape_v = (target_cache.max_batch_size, 
+                    target_cache.config.num_attention_heads, 
+                    target_cache.max_cache_len, 
+                    target_cache.config.head_dim)
+    
+    np_k_dtype = torch_dtype_to_numpy(k_dtype)
+    np_v_dtype = torch_dtype_to_numpy(v_dtype)
+
+    # Allocate NUMA-backed tensors for ALL layers
+    try:
+        np_k, free_k = alloc_numpy_on_node(full_shape_k, np_k_dtype, node_id)
+        np_v, free_v = alloc_numpy_on_node(full_shape_v, np_v_dtype, node_id)
+    except MemoryError as e:
+        print(f"Failed to allocate memory for layer {i} on NUMA node {node_id}: {e}")
+        raise e
+
+    # Zero-initialize the entire NUMA tensor
+    np_k.fill(0)
+    np_v.fill(0)
+
+    # Only copy data if the source tensor is not None
+    if k_src is not None and v_src is not None:
+        # Copy ONLY the filled prompt slice from warm-up cache
+        k_src_cpu = k_src.detach().to("cpu").contiguous().numpy()
+        v_src_cpu = v_src.detach().to("cpu").contiguous().numpy()
+        np_k[..., :prompt_len, :] = k_src_cpu[..., :prompt_len, :]
+        np_v[..., :prompt_len, :] = v_src_cpu[..., :prompt_len, :]
+    else:
+        # If the layer was skipped, log it for debugging
+        print(f"Layer {i} KV cache was None. Created a zero-filled tensor on NUMA.")
+
+    # Wrap as Torch tensors
+    tk = torch.from_numpy(np_k)
+    tv = torch.from_numpy(np_v)
+    # Cast back to original dtype if needed
+    if tk.dtype != k_dtype: tk = tk.to(k_dtype)
+    if tv.dtype != v_dtype: tv = tv.to(v_dtype)
+    tk.requires_grad = False
+    tv.requires_grad = False
+
+    # Replace buffers in target cache
+    target_cache._buffers[f"key_cache_{i}"] = tk
+    target_cache._buffers[f"value_cache_{i}"] = tv
+    
+    # Store the new tensors in a list for later assignment
+    new_keys.append(tk)
+    new_vals.append(tv)
+
+    free_fns.extend([free_k, free_v])
+
+# In the `offload_from_warmup_to_numa` function
+# Replace the `_fixed_seq_length` function definition.
+
+def _fixed_seq_length(self):
+    return int(prompt_len)
+
+target_cache.get_seq_length = _fixed_seq_length.__get__(target_cache, type(target_cache))
+
+
+
+
 import os, gc, ctypes
 import numpy as np
 import torch
