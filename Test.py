@@ -1,3 +1,22 @@
+# In your `build_target_cache_on_numa` function, modify it as follows:
+
+def build_target_cache_on_numa(model, batch_size, target_max_len, node_id):
+    # Big cache for actual generation (capacity), to be backed by NUMA node-1 tensors
+    cache = StaticCache(
+        max_batch_size=batch_size,
+        max_cache_len=target_max_len,
+        config=model.config
+    )
+    # The Fix: Manually and explicitly assign the model config to the cache object
+    cache.config = model.config
+    
+    return cache
+
+# No other changes are needed in the rest of your code, as this fix
+# ensures that `target_cache.config` is always a valid object.
+
+
+
 # In the `offload_from_warmup_to_numa` function
 # Replace the entire for-loop with the code below.
 
