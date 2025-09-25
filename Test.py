@@ -173,3 +173,154 @@ def manual_generate(model, tok, prompt, max_new_tokens):
 # print(tok.decode(out_ids[0]))
 
 
+# ---------- NUMA-based rehome of a Static KV cache ----------
+
+import ctypes, numpy as np, torch
+from typing import Tuple, List
+
+# Load libnuma
+libnuma = ctypes.CDLL("libnuma.so.1")
+libnuma.numa_available.restype = ctypes.c_int
+libnuma.numa_alloc_onnode.argtypes = [ctypes.c_size_t, ctypes.c_int]
+libnuma.numa_alloc_onnode.restype  = ctypes.c_void_p
+libnuma.numa_free.argtypes         = [ctypes.c_void_p, ctypes.c_size_t]
+
+if libnuma.numa_available() < 0:
+    raise RuntimeError("NUMA not available on this system")
+
+_TORCH2NP = {
+    torch.float32: np.float32,
+    torch.float16: np.float16,
+    torch.bfloat16: np.float16,   # safest portable storage; bfloat16 numpy dtype isn't universal
+    torch.int8: np.int8,
+    torch.int16: np.int16,
+    torch.int32: np.int32,
+    torch.int64: np.int64,
+    torch.uint8: np.uint8,
+}
+
+def _alloc_numpy_on_node(shape: Tuple[int, ...], np_dtype: np.dtype, node: int):
+    """Allocate a NumPy array backed by numa_alloc_onnode (no copy)."""
+    nbytes = int(np.prod(shape)) * np.dtype(np_dtype).itemsize
+    ptr = libnuma.numa_alloc_onnode(nbytes, int(node))
+    if not ptr:
+        raise MemoryError(f"numa_alloc_onnode failed for {nbytes} bytes on node {node}")
+
+    # Build a ctypes byte-buffer from the raw pointer
+    buf = (ctypes.c_uint8 * nbytes).from_address(ptr)
+    # Create a NumPy view on that memory and reshape
+    np_arr = np.frombuffer(buf, dtype=np_dtype, count=int(np.prod(shape))).reshape(shape)
+
+    # Free function closes over size
+    def _free():
+        libnuma.numa_free(ptr, nbytes)
+
+    return np_arr, ptr, _free
+
+def _to_numpy_dtype(t_dtype: torch.dtype):
+    if t_dtype not in _TORCH2NP:
+        # default to float32 if unsupported
+        return np.float32
+    return _TORCH2NP[t_dtype]
+
+def _ensure_list(x):
+    return x if isinstance(x, list) else [x]
+
+def _same_container_type(old, new_list: List[torch.Tensor]):
+    # Return list or squeeze back to tensor to match original container type
+    if isinstance(old, list):
+        return new_list
+    assert len(new_list) == 1
+    return new_list[0]
+
+def rehome_static_kv_cache_to_node(kv_cache, node: int = 1):
+    """
+    Re-allocate kv_cache.key_cache and kv_cache.value_cache on a given NUMA node.
+    Replaces tensors in-place with new CPU tensors backed by NUMA memory.
+    """
+    numa_ptrs = []
+    free_fns  = []
+
+    def rehome_one_container(container):
+        new_tensors = []
+        for t in _ensure_list(container):
+            if not isinstance(t, torch.Tensor):
+                raise TypeError("KV cache entries must be torch.Tensor")
+            # We'll keep CPU tensors; ensure a contiguous CPU source for copy
+            src = t.detach().to("cpu").contiguous()
+            shape = tuple(src.shape)
+            np_dtype = _to_numpy_dtype(src.dtype)
+
+            np_arr, ptr, free_fn = _alloc_numpy_on_node(shape, np_dtype, node)
+            # Copy bytes from old tensor -> NUMA array (no casting)
+            np.copyto(np_arr, src.numpy(), casting="no")
+
+            # Wrap as a torch tensor without copying
+            new_t = torch.from_numpy(np_arr)
+            new_t.requires_grad = False
+
+            # If original was bfloat16, upcasted to fp16 in NumPy: keep Torch dtype same as source
+            if new_t.dtype != src.dtype:
+                new_t = new_t.view(dtype=src.dtype)
+
+            new_tensors.append(new_t)
+
+            numa_ptrs.append((ptr, np_arr.nbytes))
+            free_fns.append(free_fn)
+
+        return _same_container_type(container, new_tensors)
+
+    # --- rehome key and value caches ---
+    kv_cache.key_cache   = rehome_one_container(kv_cache.key_cache)
+    kv_cache.value_cache = rehome_one_container(kv_cache.value_cache)
+
+    # (Optional) remember where we put them & how to free
+    setattr(kv_cache, "_numa_node", int(node))
+    setattr(kv_cache, "_numa_raw_ptrs", numa_ptrs)
+    setattr(kv_cache, "free_numa_cache", lambda: [fn() for fn in free_fns])
+
+    # If your class tracks a 'node' field, update it
+    if hasattr(kv_cache, "node"):
+        kv_cache.node = int(node)
+
+    return kv_cache
+
+# ----------------- usage -----------------
+# Assuming you already built your StaticCache (kv_cache) for the model:
+# kv_cache = build_static_cache_somehow(...)
+# Move everything to NUMA node 1:
+# rehome_static_kv_cache_to_node(kv_cache, node=1)
+
+# Later, if you want to explicitly free those buffers (usually not necessary until process exit):
+# kv_cache.free_numa_cache()
+
+from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers.cache_utils import StaticCache
+
+# 1. Load model & tokenizer
+model_id = "gpt2"
+tok = AutoTokenizer.from_pretrained(model_id)
+model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.float16)
+
+# 2. Build a StaticCache for your model (CPU by default)
+kv_cache = StaticCache(
+    max_batch_size=1,
+    max_cache_len=512,
+    config=model.config
+)
+
+# 3. Re-home it to NUMA node 1
+from numa_helpers import rehome_static_kv_cache_to_node   # your helper
+rehome_static_kv_cache_to_node(kv_cache, node=1)
+
+# 4. Use the cache in generation
+inputs = tok("DeepSeek is transforming inference efficiency.", return_tensors="pt")
+out = model.generate(
+    **inputs,
+    max_new_tokens=50,
+    past_key_values=kv_cache   # pass our NUMA-backed cache
+)
+
+print(tok.decode(out[0]))
+
+
