@@ -128,7 +128,7 @@ if __name__ == "__main__":
     torch.set_grad_enabled(False)
     torch.set_default_dtype(torch.float32)
     
-    model_id = "./deepseek_moe_16b_base"
+    model_id = "deepseek-ai/deepseek-moe-16b-base"
     device = "cpu"
 
     tok = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
