@@ -22,7 +22,7 @@ def torch_dtype_to_numpy(dtype):
     """Converts a torch dtype to a numpy dtype."""
     if dtype == torch.float32: return np.float32
     if dtype == torch.float16: return np.float16
-    if dtype == torch.bfloat16: return np.float16  # Note: This loses precision
+    if dtype == torch.bfloat16: return np.float16
     if dtype == torch.int64:   return np.int64
     if dtype == torch.int32:   return np.int32
     if dtype == torch.int16:   return np.int16
@@ -47,15 +47,17 @@ def alloc_numpy_on_node(shape, np_dtype, numa_node):
 # ---------------- Cache building ----------------
 def build_target_cache_on_numa(model, batch_size, target_max_len):
     """
-    Initializes a StaticCache object with the correct configuration.
+    Initializes a StaticCache object with the correct configuration and
+    explicitly sets the config attribute to avoid errors.
     """
     cache = StaticCache(
         max_batch_size=batch_size,
         max_cache_len=target_max_len,
         config=model.config
     )
-    # Store config reference for later use
-    cache._model_config = model.config
+    # The fix: Manually and explicitly assign the model config to the cache object
+    cache.config = model.config
+    
     return cache
 
 def offload_from_warmup_to_numa(target_cache, warmup_cache, prompt_len, node_id=1):
@@ -65,13 +67,15 @@ def offload_from_warmup_to_numa(target_cache, warmup_cache, prompt_len, node_id=
     """
     new_keys, new_vals, free_fns = [], [], []
 
-    # Get head_dim from the model config stored in cache
-    try:
-        model_config = target_cache._model_config
-        head_dim = model_config.hidden_size // model_config.num_attention_heads
-        num_attention_heads = model_config.num_attention_heads
-    except AttributeError:
-        raise AttributeError("Could not determine head dimension from model config. Check for `hidden_size` and `num_attention_heads`.")
+    # Get dimensions directly from the warmup cache tensors instead of config
+    if len(warmup_cache) == 0:
+        raise ValueError("Warmup cache is empty")
+    
+    # Get shape information from the first layer's tensors
+    k_sample, v_sample = warmup_cache[0]
+    batch_size, num_heads, seq_len, head_dim = k_sample.shape
+    
+    print(f"Detected cache shape: batch={batch_size}, heads={num_heads}, seq_len={seq_len}, head_dim={head_dim}")
 
     # Iterate through all layers, creating a NUMA-backed tensor for each one
     for i in range(len(warmup_cache)):
@@ -81,7 +85,7 @@ def offload_from_warmup_to_numa(target_cache, warmup_cache, prompt_len, node_id=
         v_dtype = v_src.dtype
 
         full_shape = (target_cache.max_batch_size, 
-                      num_attention_heads, 
+                      num_heads, 
                       target_cache.max_cache_len, 
                       head_dim)
         
@@ -93,25 +97,18 @@ def offload_from_warmup_to_numa(target_cache, warmup_cache, prompt_len, node_id=
             np_v, free_v = alloc_numpy_on_node(full_shape, np_v_dtype, node_id)
         except MemoryError as e:
             print(f"Failed to allocate memory for layer {i} on NUMA node {node_id}: {e}")
-            # Clean up previously allocated memory
-            for fn in free_fns:
-                fn()
             raise e
 
         np_k.fill(0)
         np_v.fill(0)
 
-        # Copy data from warmup cache - ensure proper shape handling
+        # Copy data from warmup cache
         k_src_cpu = k_src.detach().to("cpu").contiguous().numpy()
         v_src_cpu = v_src.detach().to("cpu").contiguous().numpy()
         
-        # Handle potential shape mismatches
-        src_shape = k_src_cpu.shape
-        if len(src_shape) == 4:  # [batch, heads, seq_len, head_dim]
-            np_k[:, :, :prompt_len, :] = k_src_cpu
-            np_v[:, :, :prompt_len, :] = v_src_cpu
-        else:
-            raise ValueError(f"Unexpected cache tensor shape: {src_shape}")
+        # Copy only the prompt portion
+        np_k[:, :, :prompt_len, :] = k_src_cpu
+        np_v[:, :, :prompt_len, :] = v_src_cpu
         
         tk = torch.from_numpy(np_k)
         tv = torch.from_numpy(np_v)
@@ -142,97 +139,80 @@ if __name__ == "__main__":
     device = "cpu"
 
     tok = AutoTokenizer.from_pretrained(model_id, use_fast=True)
-    if tok.pad_token is None:
-        tok.pad_token = tok.eos_token
-    
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id, 
-        torch_dtype=torch.float32,  # Use float32 directly for CPU
-        device_map=None  # Ensure we control device placement
-    )
+    model = AutoModelForCausalLM.from_pretrained(model_id, torch_dtype=torch.bfloat16)
     model.to(device)
     model.eval()
+
+    # The fix: Explicitly cast the entire model to float32 for CPU operations
+    model.to(torch.float32)
 
     prompt = "DeepSeek is transforming inference efficiency."
     inputs = tok(prompt, return_tensors="pt").to(device)
     
     # --- Custom Generation Loop ---
-    try:
-        # 1. Get the first token's output to set up the cache
-        with torch.no_grad():
-            first_output = model(
-                input_ids=inputs.input_ids,
+    # 1. Get the first token's output to set up the cache
+    with torch.no_grad():
+        first_output = model(
+            input_ids=inputs.input_ids,
+            use_cache=True,
+        )
+        
+        # This gives us the correctly populated cache tensors from the model's forward pass
+        warmup_cache = first_output.past_key_values
+        
+        # 2. Set up the NUMA-backed cache
+        batch_size = inputs.input_ids.shape[0]
+        prompt_len = inputs.input_ids.shape[1]
+        target_max_len = 2048
+        numa_node = 1
+        
+        target_cache = build_target_cache_on_numa(model, batch_size, target_max_len)
+        
+        # 3. Offload the cache to NUMA
+        target_cache = offload_from_warmup_to_numa(
+            target_cache=target_cache,
+            warmup_cache=warmup_cache,
+            prompt_len=prompt_len,
+            node_id=numa_node
+        )
+
+        # 4. Enter the generation loop
+        generated_ids = inputs.input_ids.tolist()
+        for _ in range(64):
+            # The input for the next step is only the last generated token
+            new_input_ids = torch.tensor([[generated_ids[0][-1]]], dtype=torch.long).to(device)
+            current_length = len(generated_ids[0])
+
+            # Manually create attention_mask and position_ids for the new token
+            attention_mask = torch.ones(
+                1, current_length + 1, dtype=torch.long, device=device
+            )
+            position_ids = torch.tensor(
+                [[current_length]], dtype=torch.long, device=device
+            )
+
+            # Pass the manually created tensors to the forward pass
+            output = model(
+                input_ids=new_input_ids,
+                past_key_values=target_cache,
+                attention_mask=attention_mask,
+                position_ids=position_ids,
                 use_cache=True,
             )
-            
-            # This gives us the correctly populated cache tensors from the model's forward pass
-            warmup_cache = first_output.past_key_values
-            
-            # 2. Set up the NUMA-backed cache
-            batch_size = inputs.input_ids.shape[0]
-            prompt_len = inputs.input_ids.shape[1]
-            target_max_len = 2048
-            numa_node = 1
-            
-            target_cache = build_target_cache_on_numa(model, batch_size, target_max_len)
-            
-            # 3. Offload the cache to NUMA
-            target_cache = offload_from_warmup_to_numa(
-                target_cache=target_cache,
-                warmup_cache=warmup_cache,
-                prompt_len=prompt_len,
-                node_id=numa_node
-            )
 
-            # 4. Enter the generation loop
-            generated_ids = inputs.input_ids.clone()
-            current_length = prompt_len
-            
-            for step in range(64):
-                # The input for the next step is only the last generated token
-                new_input_ids = generated_ids[:, -1:].clone()
+            next_token_logits = output.logits[0, -1, :]
+            next_token_id = torch.argmax(next_token_logits, dim=-1).item()
+            generated_ids[0].append(next_token_id)
 
-                # Create proper attention_mask for the full sequence
-                attention_mask = torch.ones(
-                    batch_size, current_length, dtype=torch.long, device=device
-                )
-                
-                # Position IDs should be the current position
-                position_ids = torch.tensor(
-                    [[current_length - 1]], dtype=torch.long, device=device
-                )
+            # The model's forward pass automatically updates the `target_cache` in-place
+            # because we passed it by reference. No need to re-assign.
 
-                # Forward pass with the cache
-                output = model(
-                    input_ids=new_input_ids,
-                    past_key_values=target_cache,
-                    attention_mask=attention_mask,
-                    position_ids=position_ids,
-                    use_cache=True,
-                )
+    # 5. Decode the final result
+    final_output = tok.decode(generated_ids[0])
+    print(final_output)
 
-                # Get next token
-                next_token_logits = output.logits[0, -1, :]
-                next_token_id = torch.argmax(next_token_logits, dim=-1).unsqueeze(0).unsqueeze(0)
-                
-                # Append to generated sequence
-                generated_ids = torch.cat([generated_ids, next_token_id], dim=1)
-                current_length += 1
-                
-                # Update the cache - it's updated in-place by the model
-                target_cache = output.past_key_values
-                
-                # Break if we hit EOS token
-                if next_token_id.item() == tok.eos_token_id:
-                    break
-
-        # 5. Decode the final result
-        final_output = tok.decode(generated_ids[0], skip_special_tokens=True)
-        print(final_output)
-
-    finally:
-        # 6. Free NUMA pages
-        if 'target_cache' in locals() and hasattr(target_cache, "free_numa"):
-            target_cache.free_numa()
-            del target_cache
+    # 6. Free NUMA pages
+    if hasattr(target_cache, "free_numa"):
+        target_cache.free_numa()
+        del target_cache
         gc.collect()
