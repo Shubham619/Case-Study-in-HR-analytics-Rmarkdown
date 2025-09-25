@@ -1,3 +1,46 @@
+def rehome_static_kv_cache_to_node(kv_cache, node=1):
+    new_keys, new_vals = [], []
+    for i, (k, v) in enumerate(zip(kv_cache.key_cache, kv_cache.value_cache)):
+        # shape matches full max_cache_len
+        shape = k.shape
+        dtype = k.dtype
+
+        # allocate buffer on NUMA node
+        np_dtype = np.float16 if dtype in (torch.float16, torch.bfloat16) else np.float32
+        nbytes = int(np.prod(shape)) * np.dtype(np_dtype).itemsize
+        ptr = libnuma.numa_alloc_onnode(nbytes, node)
+        buf = (ctypes.c_uint8 * nbytes).from_address(ptr)
+        np_arr = np.frombuffer(buf, dtype=np_dtype, count=int(np.prod(shape))).reshape(shape)
+
+        # copy full tensor (including unused zero slots)
+        np.copyto(np_arr, k.cpu().numpy())
+
+        # wrap back as torch tensor
+        new_k = torch.from_numpy(np_arr).to(k.device)
+        new_v = torch.from_numpy(np_arr.copy()).to(v.device)  # do same for value
+
+        new_keys.append(new_k)
+        new_vals.append(new_v)
+
+        # update buffers
+        kv_cache._buffers[f"key_cache_{i}"] = new_k
+        kv_cache._buffers[f"value_cache_{i}"] = new_v
+
+    kv_cache.key_cache = new_keys
+    kv_cache.value_cache = new_vals
+
+    return kv_cache
+
+kv_cache = StaticCache(
+    max_batch_size=inputs.input_ids.shape[0],
+    max_cache_len=128,
+    config=model.config
+)
+
+with torch.no_grad():
+    _ = model(**inputs, past_key_values=kv_cache)
+
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.cache_utils import DynamicCache
