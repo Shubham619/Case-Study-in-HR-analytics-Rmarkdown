@@ -1,6 +1,24 @@
 # In your `build_target_cache_on_numa` function, modify it as follows:
 # In your `if __name__ == "__main__":` block,
 # replace the `out = model.generate(...)` call.
+# In your `if __name__ == "__main__":` block,
+# replace the `out = model.generate(...)` call.
+
+# 3) Generate using a standard tuple of tuples from the NUMA-backed cache
+# First, create the tuple format that the model expects
+numa_past_key_values = tuple(
+    (target_cache.key_cache[i], target_cache.value_cache[i])
+    for i in range(len(target_cache.key_cache))
+)
+
+out = model.generate(
+    **inputs,
+    past_key_values=numa_past_key_values,
+    past_key_values_length=int(prompt_len), # <-- The fix
+    max_new_tokens=64,
+    use_cache=True
+)
+print(tok.decode(out[0]))
 
 # 3) Generate using a standard tuple of tuples from the NUMA-backed cache
 # First, create the tuple format that the model expects
