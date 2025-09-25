@@ -141,11 +141,12 @@ if __name__ == "__main__":
     with torch.no_grad():
         # Step 1: Get the initial key/value pairs for the prompt
         warmup_output = model(
-            input_ids=inputs.input_ids
+            input_ids=inputs.input_ids,
+            use_cache=True,
         )
         
         # Manually create the initial cache tuple from the output
-        warmup_cache = tuple(warmup_output.past_key_values)
+        warmup_cache = warmup_output.past_key_values
         
         # Step 2: Build the NUMA cache
         batch_size = inputs.input_ids.shape[0]
@@ -175,23 +176,22 @@ if __name__ == "__main__":
             # The input for the next step is only the last generated token
             new_input_ids = torch.tensor([[generated_ids[0][-1]]], dtype=torch.long).to(device)
             
-            # Use the past_key_values from the NUMA cache
             output = model(
                 input_ids=new_input_ids,
-                past_key_values=numa_cache
+                past_key_values=numa_cache,
+                use_cache=True,
             )
             
-            # Get the new key/value tensors for the new token
+            # Manually update the NumaKVCache with the new key/value pairs
             new_cache = output.past_key_values
-            
-            # Manually copy the new data into the NUMA cache
             for layer_idx in range(len(new_cache)):
                 new_k, new_v = new_cache[layer_idx]
                 
-                # Check for bounds to prevent errors
+                # Check for bounds to prevent errors and slice the full tensor
                 if current_length < numa_cache.max_cache_len:
-                    numa_cache.key_cache[layer_idx][:, :, current_length, :].copy_(new_k)
-                    numa_cache.value_cache[layer_idx][:, :, current_length, :].copy_(new_v)
+                    # The fix: Get the last token from the new_cache
+                    numa_cache.key_cache[layer_idx][:, :, current_length, :].copy_(new_k[:, :, -1, :].unsqueeze(2))
+                    numa_cache.value_cache[layer_idx][:, :, current_length, :].copy_(new_v[:, :, -1, :].unsqueeze(2))
 
             next_token_logits = output.logits[0, -1, :]
             next_token_id = torch.argmax(next_token_logits, dim=-1).item()
