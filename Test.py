@@ -1,5 +1,103 @@
 import torch
 import torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
+from accelerate.utils import infer_auto_device_map
+from accelerate import init_empty_weights, dispatch_model
+
+# -------------------------------
+# Expert wrapper: store weights in DRAM, compute on GPU
+# -------------------------------
+class CPUStorageExpert(nn.Module):
+    def __init__(self, expert, gpu_device="cuda:0"):
+        super().__init__()
+        self.expert_cpu = expert.to("cpu")  # keep weights in DRAM
+        self.gpu_device = gpu_device
+
+    def forward(self, *args, **kwargs):
+        # inputs -> GPU
+        args = [a.to(self.gpu_device, non_blocking=True) if torch.is_tensor(a) else a for a in args]
+        kwargs = {k: v.to(self.gpu_device, non_blocking=True) if torch.is_tensor(v) else v
+                  for k, v in kwargs.items()}
+        # temp GPU copy of weights
+        expert_gpu = self.expert_cpu.to(self.gpu_device, non_blocking=True)
+        out = expert_gpu(*args, **kwargs)
+        # free GPU copy
+        del expert_gpu
+        torch.cuda.empty_cache()
+        return out
+
+# -------------------------------
+# 1. Load config only (no weights yet)
+# -------------------------------
+model_id = "deepseek-ai/deepseek-moe-16b-base"
+config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+
+with init_empty_weights():   # build skeleton on "meta" device
+    empty_model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+
+# -------------------------------
+# 2. Infer device map (trunk/router stay GPU, experts we'll patch)
+# -------------------------------
+max_memory = {
+    0: "20GiB",    # GPU VRAM budget
+    "cpu": "200GiB"  # fallback DRAM budget
+}
+
+device_map = infer_auto_device_map(
+    empty_model,
+    max_memory=max_memory,
+    no_split_module_classes=["Block"],  # keep transformer blocks whole
+)
+
+# Force experts to CPU for now (storage only)
+for name in list(device_map.keys()):
+    if "experts" in name:
+        device_map[name] = "cpu"
+
+print("🔥 Customised auto device map:")
+for k, v in device_map.items():
+    print(f"{k} -> {v}")
+
+# -------------------------------
+# 3. Load model with dispatch_model
+# -------------------------------
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+    trust_remote_code=True,
+)
+
+model = dispatch_model(
+    model,
+    device_map=device_map,   # this streams weights safely
+    offload_dir=None         # no disk offload
+)
+
+# -------------------------------
+# 4. Patch MoE experts with CPUStorageExpert
+# -------------------------------
+for name, module in model.named_modules():
+    if "experts" in name and isinstance(module, nn.ModuleList):
+        for idx, expert in enumerate(module):
+            module[idx] = CPUStorageExpert(expert, gpu_device="cuda:0")
+
+print("✅ MoE experts now stored in DRAM but compute on GPU")
+
+# -------------------------------
+# 5. Run generation
+# -------------------------------
+tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+
+prompt = "DeepSeek MoE experts stored in DRAM, compute on GPU."
+inputs = tokenizer(prompt, return_tensors="pt").to("cuda:0")
+
+outputs = model.generate(**inputs, max_new_tokens=50)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+
+
+
+import torch
+import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
 # -------------------------------
