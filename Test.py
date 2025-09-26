@@ -1,3 +1,68 @@
+import torch
+import torch.nn as nn
+from transformers import AutoModelForCausalLM, AutoTokenizer
+
+# -------------------------------
+# Expert wrapper: store in DRAM, compute on GPU
+# -------------------------------
+class CPUStorageExpert(nn.Module):
+    def __init__(self, expert, gpu_device="cuda:0"):
+        super().__init__()
+        self.expert_cpu = expert.to("cpu")      # store weights in DRAM
+        self.gpu_device = gpu_device
+
+    def forward(self, *args, **kwargs):
+        # move inputs to GPU
+        args = [a.to(self.gpu_device, non_blocking=True) if torch.is_tensor(a) else a for a in args]
+        kwargs = {k: v.to(self.gpu_device, non_blocking=True) if torch.is_tensor(v) else v
+                  for k, v in kwargs.items()}
+
+        # bring expert weights from DRAM -> GPU temporarily
+        expert_gpu = self.expert_cpu.to(self.gpu_device, non_blocking=True)
+
+        out = expert_gpu(*args, **kwargs)   # run compute on CUDA
+
+        # free GPU copy (storage remains in CPU)
+        del expert_gpu
+        torch.cuda.empty_cache()
+
+        return out
+
+# -------------------------------
+# Load tokenizer + model
+# -------------------------------
+model_id = "deepseek-ai/deepseek-moe-16b-base"
+
+tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    torch_dtype=torch.bfloat16,
+    trust_remote_code=True
+).to("cuda:0")
+
+# -------------------------------
+# Replace all experts with wrapper
+# -------------------------------
+for name, module in model.named_modules():
+    if "experts" in name and isinstance(module, nn.ModuleList):
+        for idx, expert in enumerate(module):
+            module[idx] = CPUStorageExpert(expert, gpu_device="cuda:0")
+
+print("✅ MoE experts now stored in DRAM but computed on GPU")
+
+# -------------------------------
+# Run generation
+# -------------------------------
+prompt = "DeepSeek MoE experts stored in DRAM, compute on GPU."
+inputs = tokenizer(prompt, return_tensors="pt").to("cuda:0")
+
+outputs = model.generate(**inputs, max_new_tokens=50)
+print(tokenizer.decode(outputs[0], skip_special_tokens=True))
+
+
+
+
+
 import os, gc, ctypes
 import numpy as np
 import torch
