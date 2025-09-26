@@ -1,3 +1,31 @@
+class CPUStorageExpert(nn.Module):
+    def __init__(self, expert, gpu_device="cuda:0"):
+        super().__init__()
+        self.expert_cpu = expert.to("cpu")   # weights in DRAM
+        self.gpu_device = gpu_device
+        self.expert_gpu = None               # cached GPU copy
+
+    def _sync_weights(self):
+        if self.expert_gpu is None:
+            # First time: create GPU module and load weights
+            self.expert_gpu = self.expert_cpu.to_empty(device=self.gpu_device)
+            self.expert_gpu.load_state_dict(self.expert_cpu.state_dict(), strict=True)
+        else:
+            # Refresh weights if CPU changed
+            self.expert_gpu.load_state_dict(self.expert_cpu.state_dict(), strict=True)
+
+    def forward(self, *args, **kwargs):
+        # Ensure inputs are on GPU
+        args = [a.to(self.gpu_device, non_blocking=True) if torch.is_tensor(a) else a
+                for a in args]
+        kwargs = {k: v.to(self.gpu_device, non_blocking=True) if torch.is_tensor(v) else v
+                  for k, v in kwargs.items()}
+
+        # Sync once, reuse GPU copy
+        self._sync_weights()
+
+        return self.expert_gpu(*args, **kwargs)
+
 import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
