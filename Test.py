@@ -2,23 +2,28 @@
 import torch
 import torch.nn as nn
 from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer
-from accelerate.utils import infer_auto_device_map
-from accelerate import dispatch_model, init_empty_weights
+from accelerate import init_empty_weights, infer_auto_device_map, load_checkpoint_and_dispatch
+from huggingface_hub import snapshot_download
 
 # =========================
-# Config
+# Config (same idea as yours)
 # =========================
 model_id = "deepseek-ai/deepseek-moe-16b-base"
 gpu      = "cuda:0"
-dtype    = torch.bfloat16                     # or torch.float16 if needed
-vram_gib = "20GiB"                            # GPU budget for trunk/router/KV
-dram_gib = "200GiB"                           # DRAM budget for experts
+dtype    = torch.bfloat16        # use torch.float16 if needed
+vram_gib = "20GiB"               # GPU budget for trunk/router/KV
+dram_gib = "200GiB"              # DRAM budget for experts etc.
 
 # =========================
-# 1) Build meta skeleton + infer auto device_map
+# 0) Download the checkpoint LOCALLY for load_checkpoint_and_dispatch
+#    (It needs a path, not just a repo id)
+# =========================
+ckpt_dir = snapshot_download(model_id)  # local folder path with all shards
+
+# =========================
+# 1) Build meta skeleton + infer device_map
 # =========================
 config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-
 with init_empty_weights():
     empty_model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
 
@@ -40,22 +45,20 @@ for i, (k, v) in enumerate(device_map.items()):
 print("...")
 
 # =========================
-# 2) Load and dispatch model per device_map (NO disk offload)
+# 2) STREAM weights into the meta skeleton (this MATERIALIZES tensors)
 # =========================
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    torch_dtype=dtype,
-    trust_remote_code=True,
-)
-model = dispatch_model(
-    model,
+model = load_checkpoint_and_dispatch(
+    empty_model,
+    checkpoint=ckpt_dir,                  # IMPORTANT: local path
     device_map=device_map,
-    offload_dir=None  # important: don't use disk
+    no_split_module_classes=["Block"],
+    dtype=dtype,
+    offload_folder=None,                  # no disk offload
 )
 
 # =========================
 # 3) Patch experts: DRAM storage, CUDA compute (NO GPU caching)
-#    >>> Corrected to use .to_empty(...) for module cloning <<<
+#    Use .to_empty(...) + load_state_dict(...) — never .to(module)
 # =========================
 def patch_expert_forward_no_cache(expert: nn.Module, gpu_device: str = "cuda:0"):
     """
@@ -69,23 +72,28 @@ def patch_expert_forward_no_cache(expert: nn.Module, gpu_device: str = "cuda:0")
     original_forward = expert.forward
     cuda_dev = torch.device(gpu_device)
 
-    # Ensure these are REAL tensors (dispatch_model has loaded them)
+    # Ensure there are NO meta tensors now (load_checkpoint_and_dispatch should have materialized everything)
     for p in expert.parameters(recurse=True):
-        if getattr(p, "is_meta", False):
-            raise RuntimeError("Expert still has meta tensors; dispatch/load failed.")
+        # robust meta check across torch versions
+        if getattr(p, "is_meta", False) or (hasattr(p, "device") and p.device.type == "meta"):
+            raise RuntimeError(
+                "Expert still has meta tensors; load failed. "
+                "Make sure load_checkpoint_and_dispatch() succeeded and checkpoint path is correct."
+            )
 
     def wrapped_forward(*args, **kwargs):
         # Inputs should already be on CUDA; ensure anyway (no-op if already CUDA)
         args   = [a.to(cuda_dev, non_blocking=True) if torch.is_tensor(a) else a for a in args]
         kwargs = {k: (v.to(cuda_dev, non_blocking=True) if torch.is_tensor(v) else v) for k, v in kwargs.items()}
 
-        # >>> CORRECT: create an EMPTY GPU clone of the module (no data copied implicitly)
+        # Temporary GPU clone with correct structure (NO implicit data copies)
         expert_gpu = expert.to_empty(device=cuda_dev)
 
-        # Load weights/buffers from CPU expert (safe; name-aligned)
-        expert_gpu.load_state_dict(expert.state_dict(), strict=True)
+        # Load weights/buffers from CPU expert (by name, safe)
+        state = expert.state_dict()
+        expert_gpu.load_state_dict(state, strict=True)
 
-        # Ensure dtype on GPU clone (if needed)
+        # Ensure dtype on GPU clone
         for p in expert_gpu.parameters(recurse=True):
             p.data = p.data.to(dtype)
         for b in expert_gpu.buffers(recurse=True):
@@ -103,7 +111,7 @@ def patch_expert_forward_no_cache(expert: nn.Module, gpu_device: str = "cuda:0")
 
     expert.forward = wrapped_forward
 
-# Patch every ModuleList named "...experts"
+# Apply the patch to every ModuleList named "...experts"
 patched = 0
 for name, module in model.named_modules():
     if "experts" in name and isinstance(module, nn.ModuleList):
@@ -114,7 +122,7 @@ print(f"Patched experts (no GPU cache): {patched}")
 assert patched > 0, "No experts found to patch; check module names."
 
 # =========================
-# 4) Tokenizer + quick sanity
+# 4) Tokenizer + sanity
 # =========================
 tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 
