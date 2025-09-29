@@ -1,4 +1,91 @@
-# -*- coding: utf-8 -*-
+#
+import torch, gc
+from transformers import AutoTokenizer, AutoModelForCausalLM
+
+# --- Model ---
+MODEL = "Qwen/Qwen1.5-MoE-A2.7B"
+dtype = torch.float16
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+print(f"Loading {MODEL} on {device}…")
+tok = AutoTokenizer.from_pretrained(MODEL, trust_remote_code=True)
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL,
+    torch_dtype=dtype,
+    device_map="auto",          # or {"": "cpu"} if you want DDR-only
+    trust_remote_code=True,
+)
+
+# --- Prefill test ---
+def test_prefill(context_len):
+    prompt = "Data " * context_len
+    inputs = tok(prompt, return_tensors="pt").to(device)
+
+    torch.cuda.empty_cache(); gc.collect()
+    torch.cuda.reset_peak_memory_stats()
+
+    print(f"\nRunning prefill for {context_len} tokens…")
+    with torch.no_grad():
+        _ = model(**inputs, use_cache=True)
+
+    peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
+    print(f"Prefill done. Peak VRAM usage: {peak_gb:.2f} GB")
+
+# --- Sweep different context lengths ---
+for L in [2048, 4096, 8192, 16384]:
+    try:
+        test_prefill(L)
+    except RuntimeError as e:
+        print(f"OOM at {L} tokens -> {e}")
+        break
+
+
+
+
+
+import torch, gc
+from vllm import LLM, SamplingParams
+from vllm.config import KVTransferConfig
+from transformers import AutoTokenizer
+
+MODEL = "Qwen/Qwen1.5-MoE-A2.7B"
+
+# Tokenizer
+tok = AutoTokenizer.from_pretrained(MODEL)
+
+# Long dummy context
+context_len = 8192   # adjust to test 4k, 8k, 16k
+prompt = "Data " * context_len
+
+# Sampling params: no generation, just prefill
+sp = SamplingParams(max_tokens=0)
+
+# vLLM engine
+kv_cfg = KVTransferConfig(kv_connector="LMCacheConnectorV1", kv_role="kv_both")
+llm = LLM(
+    model=MODEL,
+    dtype="half",
+    max_model_len=context_len,
+    gpu_memory_utilization=0.40,
+    cpu_offload_gb=64,         # offload experts if needed
+    kv_transfer_config=kv_cfg,
+    enforce_eager=True,
+)
+
+# Run prefill
+torch.cuda.reset_peak_memory_stats()
+gc.collect()
+
+print(f"Running prefill for context length {context_len}...")
+outs = llm.generate([prompt], sp)   # will only run prefill, no new tokens
+
+peak_gb = torch.cuda.max_memory_allocated() / (1024**3)
+print(f"Prefill done. Peak VRAM = {peak_gb:.2f} GB")
+
+
+
+
+-*- coding: utf-8 -*-
 import torch
 import torch.nn as nn
 from huggingface_hub import snapshot_download
