@@ -334,3 +334,46 @@ print(f"\n[Decode] {MAX_NEW_TOKENS} tokens in {time.time()-start:.2f}s  |  final
 # Output
 for i in range(B):
     print(f"\n--- OUTPUT {i} ---\n{tokenizer.decode(cur_ids[i], skip_special_tokens=True)}")
+
+
+
+
+# List of expert indices sorted by importance (high → low)
+top_experts = [eid for eid, _ in top_by_usage]   # or top_by_score
+
+def move_expert_to_gpu(model, layer_idx, expert_idx, device="cuda:0"):
+    expert = model.model.layers[layer_idx].mlp.experts[expert_idx]
+    expert.to(device)
+    torch.cuda.synchronize()
+    print(f"--> Expert {expert_idx} in layer {layer_idx} moved to {device}")
+
+
+def get_free_mem():
+    alloc = torch.cuda.memory_allocated()
+    reserv = torch.cuda.memory_reserved()
+    return reserv - alloc  # how much allocator can give without new malloc
+
+
+moved_experts = set()
+
+for step in range(max_new_tokens):
+    outputs = model(**inputs, past_key_values=cache, use_cache=True)
+
+    free_now = get_free_mem()
+    print(f"Step {step} | Free in pool: {free_now/1e9:.2f} GB")
+
+    # If memory ≥ 2 GB free and we still have experts to move
+    if free_now > 2 * 1024**3:
+        # Move up to 5 of the most important experts
+        count = 0
+        for layer_idx, layer in enumerate(model.model.layers):
+            for expert_idx in top_experts:
+                key = (layer_idx, expert_idx)
+                if key not in moved_experts:
+                    move_expert_to_gpu(model, layer_idx, expert_idx)
+                    moved_experts.add(key)
+                    count += 1
+                    if count >= 5:   # only move 5 this step
+                        break
+            if count >= 5:
+                break
