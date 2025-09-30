@@ -1,12 +1,16 @@
 import os
+# allocator tuned to reduce fragmentation (keeps freed VRAM usable)
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync,expandable_segments:True")
 
 import time
 from collections import OrderedDict, defaultdict
+
 import torch
 import torch.nn as nn
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 from transformers.cache_utils import StaticCache
+from accelerate import init_empty_weights, infer_auto_device_map, load_checkpoint_and_dispatch
+from huggingface_hub import snapshot_download
 
 # ============================ Config ============================
 model_id   = "Qwen/Qwen1.5-MoE-A2.7B"
@@ -14,43 +18,56 @@ gpu_device = "cuda:0"
 cpu_device = "cpu"
 dtype      = torch.float16
 
-GPU_CACHE_MAX_BYTES   = 2_000_000_000
-GPU_CACHE_MAX_EXPERTS = 8
-MAX_NEW_TOKENS        = 128
+# Keep trunk/router/attention on GPU within this budget (experts -> CPU)
+max_memory = {
+    0:   "10GiB",   # slight bump helps keep attention on GPU with KV
+    "cpu":"300GiB"
+}
 
-# ==================== Load full model on CPU ====================
-print(f"Loading {model_id} fully on CPU …")
-tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained(
-    model_id,
-    torch_dtype=dtype,
-    trust_remote_code=True,
-    device_map={"": cpu_device},   # no meta tensors
+# Expert cache knobs (kept & auto-tightened post-prefill)
+GPU_CACHE_MAX_BYTES   = 2_000_000_000   # ~2.0 GB cap for resident experts
+GPU_CACHE_MAX_EXPERTS = 8               # at most 8 experts resident
+MAX_NEW_TOKENS        = 128
+SAFETY_GB             = 2.0
+
+# ==================== Load & dispatch (experts → CPU, attn → GPU) ====================
+print(f"Loading config & skeleton for {model_id} …")
+config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+with init_empty_weights():
+    empty_model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+
+print("Inferring device_map …")
+no_split = getattr(empty_model, "_no_split_modules", ["QwenBlock", "Block"])
+device_map = infer_auto_device_map(empty_model, max_memory=max_memory, no_split_module_classes=no_split)
+
+# Force attention/trunk on GPU, experts on CPU (by name heuristics)
+for name in list(device_map.keys()):
+    low = name.lower()
+    if ("experts" in low):
+        device_map[name] = cpu_device
+    elif ("attn" in low) or ("attention" in low) or ("rotary" in low):
+        device_map[name] = gpu_device  # keep attention & KV writers on GPU
+
+print("Downloading checkpoints & dispatching …")
+local_ckpt = snapshot_download(model_id, allow_patterns=["*.safetensors","*.bin","config.json","*.json"])
+model = load_checkpoint_and_dispatch(
+    empty_model,
+    checkpoint=local_ckpt,
+    device_map=device_map,
+    no_split_module_classes=no_split,
+    dtype=dtype,
+    offload_folder=None,
 )
+tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=True)
 model.eval(); model.config.use_cache = True
 
-# ==================== Move trunk + gates to GPU =================
-def move_trunk_and_gates(model, gpu_device, dtype):
-    dev = torch.device(gpu_device)
-    for name, mod in model.named_modules():
-        if "experts" in name:
-            continue  # skip experts
-        has_param = any(True for _ in mod.parameters(recurse=False))
-        if has_param:
-            mod.to(dev, dtype=dtype)
-    for li, layer in enumerate(model.model.layers):
-        if hasattr(layer.mlp, "gate"):
-            layer.mlp.gate.to(dev, dtype=dtype)
-            if hasattr(layer.mlp.gate, "proj"):
-                layer.mlp.gate.proj.to(dev, dtype=dtype)
-
-print("Moving trunk + gates to GPU …")
-move_trunk_and_gates(model, gpu_device, dtype)
-
-# ================= Expert LRU cache =============================
+# ================= Expert LRU cache (resident-on-GPU modules) =================
 def tensor_nbytes(t: torch.Tensor) -> int: return t.numel() * t.element_size()
 def module_param_bytes(mod: nn.Module) -> int:
-    return sum(tensor_nbytes(p.data) for p in mod.parameters(recurse=True))
+    s = 0
+    for p in mod.parameters(recurse=True): s += tensor_nbytes(p.data)
+    for b in mod.buffers(recurse=True):   s += tensor_nbytes(b.data)
+    return s
 
 def pin_state_dict(cpu_module: nn.Module):
     pinned = {}
@@ -63,135 +80,233 @@ def pin_state_dict(cpu_module: nn.Module):
     return pinned
 
 class ExpertGPUCache:
-    def __init__(self, device, dtype, max_bytes, max_count):
+    def __init__(self, device:str, dtype:torch.dtype,
+                 max_bytes:int=GPU_CACHE_MAX_BYTES, max_count:int=GPU_CACHE_MAX_EXPERTS):
         self.device = torch.device(device); self.dtype = dtype
         self.max_bytes = max_bytes; self.max_count = max_count
-        self._cache = OrderedDict(); self._sizes = {}; self._pinned_sd = {}
+        self._cache: OrderedDict[int, nn.Module] = OrderedDict()
+        self._sizes: dict[int,int] = {}
+        self._pinned_sd: dict[int,dict] = {}
         self._bytes_total = 0
+        self.prefetch_stream = torch.cuda.Stream(device=self.device)
+        self.main_stream = torch.cuda.current_stream(device=self.device)
 
-    def _ensure_capacity(self, need_bytes):
-        while (self._bytes_total + need_bytes > self.max_bytes) or (len(self._cache) >= self.max_count):
-            eid, mod = self._cache.popitem(last=False)
-            self._bytes_total -= self._sizes.pop(eid, 0)
-            del mod
+    def _ensure_capacity(self, need_bytes:int):
+        while (self._bytes_total + need_bytes > self.max_bytes) or (len(self._cache)+1 > self.max_count):
+            evict_id, evict_mod = self._cache.popitem(last=False)
+            self._bytes_total -= self._sizes.pop(evict_id, 0)
+            del evict_mod
 
-    def _build_cuda_module(self, cpu_expert):
-        import copy
-        return copy.deepcopy(cpu_expert).to(self.device, dtype=self.dtype)
+    def _build_cuda_module(self, cpu_expert: nn.Module) -> nn.Module:
+        cls = cpu_expert.__class__
+        if hasattr(cpu_expert, "config"):
+            m = cls(config=cpu_expert.config).to(self.device, dtype=self.dtype)
+        else:
+            import copy as _copy
+            m = _copy.deepcopy(cpu_expert).to(self.device, dtype=self.dtype)
+        return m
 
-    def _load_weights(self, cuda_mod, expert_id):
+    def _load_weights_async(self, cuda_mod: nn.Module, expert_id:int):
         if expert_id not in self._pinned_sd:
             self._pinned_sd[expert_id] = pin_state_dict(cpu_expert_registry[expert_id])
         sd = self._pinned_sd[expert_id]
-        for k, v_cpu in sd.items():
-            ref = cuda_mod
-            parts = k.split(".")
-            for c in parts[:-1]:
-                if hasattr(ref, c): ref = getattr(ref, c)
-            leaf = parts[-1]
-            if hasattr(ref, leaf):
-                getattr(ref, leaf).data.copy_(v_cpu, non_blocking=True)
+        with torch.cuda.stream(self.prefetch_stream):
+            for k, v_cpu in sd.items():
+                ref = cuda_mod
+                comps = k.split(".")
+                for c in comps[:-1]: ref = getattr(ref, c)
+                leaf = comps[-1]
+                if hasattr(ref, leaf):
+                    t = getattr(ref, leaf)
+                    t.data.copy_(v_cpu, non_blocking=True)
+        self.main_stream.wait_stream(self.prefetch_stream)
+        torch.cuda.current_stream(self.device).synchronize()
 
-    def get(self, eid, cpu_expert):
-        if eid in self._cache:
-            mod = self._cache.pop(eid); self._cache[eid] = mod; return mod
-        cuda_mod = self._build_cuda_module(cpu_expert)
+    def get(self, expert_id:int, cpu_expert: nn.Module) -> nn.Module:
+        if expert_id in self._cache:
+            mod = self._cache.pop(expert_id); self._cache[expert_id] = mod; return mod
+        cuda_mod  = self._build_cuda_module(cpu_expert)
         need_bytes = module_param_bytes(cuda_mod)
         self._ensure_capacity(need_bytes)
-        self._load_weights(cuda_mod, eid)
-        self._cache[eid] = cuda_mod; self._sizes[eid] = need_bytes
+        self._load_weights_async(cuda_mod, expert_id)
+        self._cache[expert_id] = cuda_mod
+        self._sizes[expert_id] = need_bytes
         self._bytes_total += need_bytes
         return cuda_mod
 
-# ================== Discover experts (CPU) ======================
-cpu_expert_registry, expert_name_map = {}, {}
+    def prefetch_experts(self, ids:list[int]):
+        with torch.no_grad():
+            for eid in ids:
+                if eid in self._cache:
+                    mod = self._cache.pop(eid); self._cache[eid] = mod
+                else:
+                    if eid not in cpu_expert_registry: continue
+                    cpu_mod = cpu_expert_registry[eid]
+                    cuda_mod = self._build_cuda_module(cpu_mod)
+                    need_bytes = module_param_bytes(cuda_mod)
+                    self._ensure_capacity(need_bytes)
+                    self._load_weights_async(cuda_mod, eid)
+                    self._cache[eid] = cuda_mod
+                    self._sizes[eid] = need_bytes
+                    self._bytes_total += need_bytes
+
+# Build registry of CPU experts
+cpu_expert_registry: dict[int, nn.Module] = {}
+expert_name_map: dict[int,str] = {}
 eid = 0
 for name, module in model.named_modules():
     if isinstance(module, nn.ModuleList) and "experts" in name:
         for idx, expert in enumerate(module):
-            cpu_expert_registry[eid] = expert
-            expert_name_map[eid] = f"{name}[{idx}]"
-            eid += 1
-print(f"CPU-resident experts: {len(cpu_expert_registry)}")
+            try: dev = next(expert.parameters()).device.type
+            except StopIteration: dev = cpu_device
+            if dev == cpu_device:
+                cpu_expert_registry[eid] = expert
+                expert_name_map[eid] = f"{name}[{idx}]"
+                eid += 1
+print(f"CPU-resident experts discovered: {len(cpu_expert_registry)}")
 
-expert_cache = ExpertGPUCache(gpu_device, dtype, GPU_CACHE_MAX_BYTES, GPU_CACHE_MAX_EXPERTS)
+expert_cache = ExpertGPUCache(device=gpu_device, dtype=dtype,
+                              max_bytes=GPU_CACHE_MAX_BYTES, max_count=GPU_CACHE_MAX_EXPERTS)
 
-# ================= Wrap experts ================================
+# ============== Wrap experts: route via LRU & count usage; RETURN to caller device ==============
 expert_call_counts = defaultdict(int)
-def make_cached_forward(eid, cpu_expert):
-    def fwd(*args, **kwargs):
-        expert_call_counts[eid] += 1
-        args = [a.to(gpu_device, non_blocking=True) if torch.is_tensor(a) else a for a in args]
-        kwargs = {k: v.to(gpu_device, non_blocking=True) if torch.is_tensor(v) else v for k,v in kwargs.items()}
-        cuda_expert = expert_cache.get(eid, cpu_expert)
-        return cuda_expert(*args, **kwargs)
-    return fwd
 
-for eid, exp in cpu_expert_registry.items():
-    exp.forward = make_cached_forward(eid, exp)
+def make_cached_forward(expert_id:int, cpu_expert: nn.Module):
+    def wrapped_forward(*args, **kwargs):
+        expert_call_counts[expert_id] += 1  # prefill usage signal
 
-# ================= Inputs + KV ================================
-PROMPTS = ["Explain dynamic offloading in large language models."]
-inputs = tokenizer(PROMPTS, return_tensors="pt").to(gpu_device)
+        # Determine caller's device from first tensor (keeps block happy)
+        def first_tensor_device():
+            for x in args:
+                if torch.is_tensor(x): return x.device
+            for v in kwargs.values():
+                if torch.is_tensor(v): return v.device
+            try: return next(cpu_expert.parameters()).device
+            except StopIteration: return torch.device("cpu")
+
+        caller_dev = first_tensor_device()
+        cuda_dev   = torch.device(gpu_device)
+
+        # Move inputs to CUDA for compute
+        def to_cuda(x): return x.to(cuda_dev, non_blocking=True) if torch.is_tensor(x) else x
+        args_cuda   = tuple(to_cuda(a) for a in args)
+        kwargs_cuda = {k: to_cuda(v) for k, v in kwargs.items()}
+
+        # Run CUDA expert
+        cuda_expert = expert_cache.get(expert_id, cpu_expert)
+        with torch.no_grad():
+            out = cuda_expert(*args_cuda, **kwargs_cuda)
+
+        # Return outputs on the caller's device (prevents device-mismatch)
+        def to_caller(y):
+            if torch.is_tensor(y): return y.to(caller_dev, non_blocking=True)
+            if isinstance(y, (list, tuple)): return type(y)(to_caller(t) for t in y)
+            if isinstance(y, dict): return {k: to_caller(v) for k, v in y.items()}
+            return y
+
+        return to_caller(out)
+    return wrapped_forward
+
+for eid_, cpu_expert in cpu_expert_registry.items():
+    cpu_expert.forward = make_cached_forward(eid_, cpu_expert)
+
+# =================== Prepare inputs, single GPU KV, ONE prefill ======================
+PROMPTS = ["Explain the concept of dynamic offloading in large language models in one paragraph."]
+inputs = tokenizer(PROMPTS, return_tensors="pt", padding=True, truncation=False)
+inputs = {k: v.to(gpu_device) for k, v in inputs.items()}
 
 B = inputs["input_ids"].size(0)
 prompt_len = inputs["input_ids"].size(1)
+max_new = MAX_NEW_TOKENS
 
+# Single, GPU-resident KV for the whole run
 kv = StaticCache(
     max_batch_size=B,
-    max_cache_len=prompt_len + MAX_NEW_TOKENS,
+    max_cache_len=prompt_len + max_new,  # reserve up to final length
     config=model.config,
     device=torch.device(gpu_device),
-    dtype=dtype,
+    dtype=model.dtype,
 )
 
-# ================= Prefill ================================
-print("Running prefill …")
+def gb(x): return x/1e9
+torch.cuda.reset_peak_memory_stats(); torch.cuda.synchronize()
+base_alloc = torch.cuda.memory_allocated()
+
+# ------------------------- ONE PREFILL (fills KV & counts experts) -------------------
 with torch.inference_mode():
     _ = model(**inputs, use_cache=True, past_key_values=kv)
 
-print(f"Prefill done. Experts called: {dict(list(expert_call_counts.items())[:10])}")
+torch.cuda.synchronize()
+prefill_peak = torch.cuda.max_memory_allocated()
+post_prefill = torch.cuda.memory_allocated()
+free_bytes, total_bytes = torch.cuda.mem_get_info()
+print(f"\n[MEM] base={gb(base_alloc):.2f} GB  peak_prefill={gb(prefill_peak):.2f} GB  "
+      f"post_prefill={gb(post_prefill):.2f} GB  free={gb(free_bytes):.2f}/{gb(total_bytes):.2f} GB")
 
-# ================= Decode with promotions =================
-def get_free_mem():
-    return torch.cuda.memory_reserved() - torch.cuda.memory_allocated()
+# ------------------ Decide which experts to pin (NO 2nd prefill) --------------------
+# Rank by prefill usage
+sorted_eids = sorted(expert_call_counts.keys(), key=lambda k: expert_call_counts[k], reverse=True)
+print("\n[Prefill usage] top experts:")
+for i, e in enumerate(sorted_eids[:12]):
+    print(f"  {i+1:2d}. EID {e:<4d} calls={expert_call_counts[e]:<6d}  {expert_name_map.get(e,'')}")
 
-def move_expert_to_gpu(layer_idx, expert_idx):
-    exp = model.model.layers[layer_idx].mlp.experts[expert_idx]
-    exp.to(gpu_device)
-    print(f"--> Expert {expert_idx} from layer {layer_idx} moved to GPU")
+# Probe per-expert size once (temporary CUDA instantiation; NOT another prefill)
+def probe_expert_bytes(eid_probe:int) -> int:
+    cpu_mod = cpu_expert_registry[eid_probe]
+    cls = cpu_mod.__class__
+    if hasattr(cpu_mod, "config"):
+        tmp = cls(config=cpu_mod.config).to(gpu_device, dtype=dtype)
+    else:
+        import copy as _copy
+        tmp = _copy.deepcopy(cpu_mod).to(gpu_device, dtype=dtype)
+    nbytes = module_param_bytes(tmp)
+    del tmp; torch.cuda.synchronize()
+    return nbytes
 
-sorted_eids = sorted(expert_call_counts, key=lambda e: expert_call_counts[e], reverse=True)
-moved_experts = set()
+per_expert_bytes = probe_expert_bytes(sorted_eids[0]) if sorted_eids else 50_000_000
+safety = int(SAFETY_GB * 1e9)
+max_by_bytes = max(0, (free_bytes - safety) // max(per_expert_bytes, 1))
+target_keep = int(min(GPU_CACHE_MAX_EXPERTS, max_by_bytes))
+target_keep = max(0, target_keep)
 
+# Tighten caps to the plan (keep both knobs)
+expert_cache.max_count = target_keep
+expert_cache.max_bytes = int(min(GPU_CACHE_MAX_BYTES, per_expert_bytes * target_keep))
+
+# Prefetch the chosen top-K NOW (still before any decode tokens)
+top_keep_ids = sorted_eids[:target_keep]
+expert_cache.prefetch_experts(top_keep_ids)
+print(f"\n[Plan] Keep top-{target_keep} experts on GPU (~{gb(per_expert_bytes):.2f} GB each); "
+      f"cache caps → bytes={gb(expert_cache.max_bytes):.2f} GB, count={expert_cache.max_count}")
+print(f"[Plan] Prefetched EIDs: {top_keep_ids}")
+
+# ================================ Decode (reuse same KV) =============================
 cur_ids = inputs["input_ids"]
-attn_mask = torch.zeros((B, prompt_len + MAX_NEW_TOKENS), dtype=torch.long, device=gpu_device)
+attn_mask = torch.zeros((B, prompt_len + max_new), dtype=torch.long, device=gpu_device)
 attn_mask[:, :prompt_len] = 1
 cur_len = prompt_len
 
-print("Decoding …")
-for step in range(MAX_NEW_TOKENS):
+start = time.time()
+for step in range(max_new):
     with torch.inference_mode():
-        step_input = cur_ids[:, cur_len-1:cur_len]
-        logits = model(input_ids=step_input, attention_mask=attn_mask[:, :cur_len],
-                       use_cache=True, past_key_values=kv).logits
+        step_input = cur_ids[:, cur_len-1:cur_len].contiguous()
+        logits = model(
+            input_ids=step_input,
+            attention_mask=attn_mask[:, :cur_len],
+            use_cache=True,
+            past_key_values=kv
+        ).logits
         next_ids = logits[:, -1].argmax(dim=-1, keepdim=True)
         cur_ids = torch.cat([cur_ids, next_ids], dim=1)
         attn_mask[:, cur_len] = 1
         cur_len += 1
+    if (step+1) % 16 == 0:
+        torch.cuda.synchronize()
+        print(f"after {step+1:4d} decode tokens: mem_alloc={gb(torch.cuda.memory_allocated()):.2f} GB")
 
-    free_now = get_free_mem()
-    if free_now > 2 * 1024**3:  # ≥2 GB free
-        count = 0
-        for li, layer in enumerate(model.model.layers):
-            for eid in sorted_eids:
-                key = (li, eid)
-                if key not in moved_experts:
-                    move_expert_to_gpu(li, eid)
-                    moved_experts.add(key)
-                    count += 1
-                    if count >= 5: break
-            if count >= 5: break
+torch.cuda.synchronize()
+print(f"\n[Decode] {MAX_NEW_TOKENS} tokens in {time.time()-start:.2f}s  |  final_alloc={gb(torch.cuda.memory_allocated()):.2f} GB")
 
-print("\n--- OUTPUT ---")
-print(tokenizer.decode(cur_ids[0], skip_special_tokens=True))
+# Output
+for i in range(B):
+    print(f"\n--- OUTPUT {i} ---\n{tokenizer.decode(cur_ids[i], skip_special_tokens=True)}")
