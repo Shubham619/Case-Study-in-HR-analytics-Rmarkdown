@@ -24,11 +24,11 @@ max_memory = {
     "cpu":"300GiB"
 }
 
-# Expert cache knobs (kept & auto-tightened post-prefill)
+# Expert cache knobs (kept & tuned at runtime)
 GPU_CACHE_MAX_BYTES   = 2_000_000_000   # ~2.0 GB cap for resident experts
 GPU_CACHE_MAX_EXPERTS = 8               # at most 8 experts resident
 MAX_NEW_TOKENS        = 128
-SAFETY_GB             = 2.0
+SAFETY_GB             = 2.0             # headroom before promoting more experts
 
 # ==================== Load & dispatch (experts → CPU, attn → GPU) ====================
 print(f"Loading config & skeleton for {model_id} …")
@@ -173,7 +173,7 @@ expert_call_counts = defaultdict(int)
 
 def make_cached_forward(expert_id:int, cpu_expert: nn.Module):
     def wrapped_forward(*args, **kwargs):
-        expert_call_counts[expert_id] += 1  # prefill usage signal
+        expert_call_counts[expert_id] += 1  # prefill+decode usage signal
 
         # Determine caller's device from first tensor (keeps block happy)
         def first_tensor_device():
@@ -280,6 +280,45 @@ print(f"\n[Plan] Keep top-{target_keep} experts on GPU (~{gb(per_expert_bytes):.
       f"cache caps → bytes={gb(expert_cache.max_bytes):.2f} GB, count={expert_cache.max_count}")
 print(f"[Plan] Prefetched EIDs: {top_keep_ids}")
 
+# ===================== Dynamic promoter (grow during decode) =========================
+prefill_rank = sorted_eids[:]                  # hottest → coldest
+_promote_cursor = len(top_keep_ids)            # next index to promote
+
+def cuda_free_bytes():
+    fb, _ = torch.cuda.mem_get_info()
+    return int(fb)
+
+def try_promote_one_more_expert(safety_bytes:int, per_expert_bytes:int):
+    global _promote_cursor
+    if _promote_cursor >= len(prefill_rank):
+        return False  # nothing left to promote
+
+    free_now = cuda_free_bytes()
+    # need room for one more expert plus a small cushion
+    need = per_expert_bytes + max(2 << 20, per_expert_bytes // 8)  # +2MB or +12.5%
+    if free_now <= safety_bytes + need:
+        return False
+
+    # Respect knobs; allow gentle growth if obvious headroom exists
+    if len(expert_cache._cache) >= expert_cache.max_count:
+        if expert_cache._bytes_total + per_expert_bytes <= expert_cache.max_bytes:
+            expert_cache.max_count += 1
+        elif expert_cache._bytes_total + per_expert_bytes <= expert_cache.max_bytes + (per_expert_bytes // 2):
+            expert_cache.max_bytes += per_expert_bytes  # relax bytes cap minimally
+        else:
+            return False  # cannot grow within policy
+
+    # Final guard
+    if (len(expert_cache._cache) + 1 > expert_cache.max_count) or \
+       (expert_cache._bytes_total + per_expert_bytes > expert_cache.max_bytes):
+        return False
+
+    eid = prefill_rank[_promote_cursor]
+    _promote_cursor += 1
+    expert_cache.prefetch_experts([eid])
+    print(f"[Promote] Pinned EID {eid} to GPU (free~{cuda_free_bytes()/1e9:.2f} GB)")
+    return True
+
 # ================================ Decode (reuse same KV) =============================
 cur_ids = inputs["input_ids"]
 attn_mask = torch.zeros((B, prompt_len + max_new), dtype=torch.long, device=gpu_device)
@@ -287,7 +326,7 @@ attn_mask[:, :prompt_len] = 1
 cur_len = prompt_len
 
 start = time.time()
-for step in range(max_new):
+for step in range(MAX_NEW_TOKENS):
     with torch.inference_mode():
         step_input = cur_ids[:, cur_len-1:cur_len].contiguous()
         logits = model(
@@ -300,7 +339,12 @@ for step in range(max_new):
         cur_ids = torch.cat([cur_ids, next_ids], dim=1)
         attn_mask[:, cur_len] = 1
         cur_len += 1
-    if (step+1) % 16 == 0:
+
+    # Opportunistically promote one more expert every 8 steps if there's headroom
+    if (step + 1) % 8 == 0 and per_expert_bytes:
+        try_promote_one_more_expert(safety_bytes=safety, per_expert_bytes=per_expert_bytes)
+
+    if (step + 1) % 16 == 0:
         torch.cuda.synchronize()
         print(f"after {step+1:4d} decode tokens: mem_alloc={gb(torch.cuda.memory_allocated()):.2f} GB")
 
