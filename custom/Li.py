@@ -1,3 +1,60 @@
+import gc
+import psutil
+import torch
+import time
+
+papers_loaded = []
+
+def test_prefill(context_len, papers_loaded, batch_size):
+    # Load dummy text or actual text source (replace if you have your own `papers`)
+    sample_text = "Memory-aware MoE inference using DDR and CXL " * 2000
+    papers_loaded.append(sample_text[:context_len])
+
+    # Tokenize and move to CPU
+    inputs = tokenizer(papers_loaded, return_tensors="pt")
+
+    gc.collect()
+    torch.cuda.empty_cache = lambda: None  # no-op
+    print(f"\nRunning prefill for batch={len(papers_loaded)}, context_len={context_len} tokens...")
+
+    # Measure peak CPU RAM usage
+    process = psutil.Process()
+    rss_before = process.memory_info().rss / (1024 ** 3)  # in GB
+
+    t0 = time.time()
+    with torch.no_grad():
+        _ = model(**inputs, use_cache=True)
+    t1 = time.time()
+
+    rss_after = process.memory_info().rss / (1024 ** 3)
+    peak_gb = rss_after - rss_before
+    print(f"Prefill done. Peak RAM usage: {peak_gb:.2f} GB, Time: {t1 - t0:.2f}s")
+
+# ------------------------
+# Sweep over context lengths
+# ------------------------
+for L in [2048, 4096, 8012, 16000]:
+    papers_loaded = []
+    try:
+        for bt in range(1, 40, 4):
+            test_prefill(L, papers_loaded, bt)
+    except RuntimeError as e:
+        print(f"[OOM] at {L} tokens -> {e}")
+        gc.collect()
+        continue
+
+
+
+
+
+
+
+
+
+
+
+
+
 import os
 # Keep Flash; allocator tuned to reduce fragmentation
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync,expandable_segments:True")
