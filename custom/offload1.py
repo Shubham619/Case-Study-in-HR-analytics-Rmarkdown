@@ -1,4 +1,26 @@
 import os
+
+def clear_linux_caches():
+    """
+    Clears the Linux page cache, dentries, and inodes by writing to 
+    /proc/sys/vm/drop_caches.
+    Requires root privileges.
+    """
+    try:
+        # 1: Clear page cache
+        # 2: Clear dentries and inodes
+        # 3: Clear page cache, dentries, and inodes
+        with open('/proc/sys/vm/drop_caches', 'w') as f:
+            f.write('3')
+        print("Linux caches cleared successfully.")
+    except PermissionError:
+        print("Permission denied. This operation requires root privileges.")
+    except Exception as e:
+        print(f"An error occurred: {e}")
+
+# Call the function to clear caches
+clear_linux_caches()
+import os
 # Keep Flash; reduce fragmentation and reuse freed VRAM
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "backend:cudaMallocAsync,expandable_segments:True")
 
