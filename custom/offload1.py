@@ -1,3 +1,47 @@
+import psutil
+import threading
+import time
+
+class MemMonitor:
+    def __init__(self, interval=0.2):
+        self.proc = psutil.Process()
+        self.interval = interval
+        self.peak_mem = 0
+        self.cpu_samples = []
+        self._stop = False
+        self._thread = None
+
+    def _track(self):
+        # Reset CPU percent baseline
+        self.proc.cpu_percent(interval=None)
+
+        while not self._stop:
+            rss = self.proc.memory_info().rss
+            if rss > self.peak_mem:
+                self.peak_mem = rss
+
+            # Record instantaneous CPU utilization of current process
+            cpu_now = self.proc.cpu_percent(interval=None)
+            self.cpu_samples.append(cpu_now)
+
+            time.sleep(self.interval)
+
+    def start(self):
+        self._stop = False
+        self.cpu_samples.clear()
+        self._thread = threading.Thread(target=self._track, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop = True
+        if self._thread:
+            self._thread.join()
+
+        avg_cpu = sum(self.cpu_samples) / len(self.cpu_samples) if self.cpu_samples else 0
+        peak_mem_gb = self.peak_mem / 1e9  # Convert bytes → GB
+        return peak_mem_gb, avg_cpu
+
+
 import psutil, threading, time
 
 class MemMonitor:
