@@ -1,3 +1,35 @@
+import psutil, threading, time
+
+class MemMonitor:
+    def __init__(self, interval=0.2):
+        self.proc = psutil.Process()
+        self.interval = interval
+        self.peak = 0
+        self._stop = False
+        self._thread = None
+
+    def _track(self):
+        while not self._stop:
+            rss = self.proc.memory_info().rss
+            if rss > self.peak:
+                self.peak = rss
+            time.sleep(self.interval)
+
+    def start(self):
+        self._stop = False
+        self._thread = threading.Thread(target=self._track, daemon=True)
+        self._thread.start()
+
+    def stop(self):
+        self._stop = True
+        if self._thread:
+            self._thread.join()
+        return self.peak / 1e9   # GB
+
+
+
+
+
 import os
 
 def clear_linux_caches():
