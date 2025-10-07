@@ -1,3 +1,57 @@
+def execute_stage(stage, inputs, max_new_token, past_key_values, attention_mask):
+    # Get batch size and sequence length
+    batch_size, seq_len = inputs.input_ids.shape
+
+    # Identify last token positions per sample
+    last_token_positions = attention_mask.sum(dim=1) - 1  # shape: [batch]
+    input_ids = inputs.input_ids.to("cpu")
+
+    # Next input: last token of each sequence
+    next_input = torch.stack(
+        [input_ids[i, pos] for i, pos in enumerate(last_token_positions)]
+    ).unsqueeze(1).to("cpu")  # shape: [batch, 1]
+
+    generated_tokens = [[] for _ in range(batch_size)]
+
+    if stage == 1:
+        for _ in range(max_new_token):
+            with torch.no_grad():
+                # Extend attention mask for each new token
+                new_mask = torch.ones((batch_size, 1), dtype=attention_mask.dtype, device="cpu")
+                attention_mask = torch.cat([attention_mask, new_mask], dim=1)
+
+                outputs = model(
+                    next_input,
+                    use_cache=True,
+                    past_key_values=past_key_values,
+                    attention_mask=attention_mask,
+                )
+
+                logits = outputs.logits[:, -1, :]  # [batch, vocab]
+                next_token = torch.argmax(logits, dim=-1, keepdim=True)  # [batch, 1]
+                past_key_values = outputs.past_key_values
+
+                # Append each sample’s token
+                for b in range(batch_size):
+                    generated_tokens[b].append(next_token[b].item())
+
+                next_input = next_token  # feed next step
+
+        # Decode each sample separately
+        decoded_texts = [
+            tokenizer.decode(tokens, skip_special_tokens=True)
+            for tokens in generated_tokens
+        ]
+        return decoded_texts
+
+
+
+
+
+
+
+
+
 import psutil
 import threading
 import time
