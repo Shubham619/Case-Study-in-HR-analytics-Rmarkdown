@@ -1,0 +1,5 @@
+sudo pcm-memory 1 | grep --line-buffered -E "System (Read|Write|Memory) Throughput" | \
+awk -v OFS=" " '
+/Read/   {r=$NF}
+/Write/  {w=$NF}
+/Memory/ {++n; m=$NF; print n, "Read:", r, "Write:", w, "Total:", m >> "pcm_log.txt"; fflush("pcm_log.txt")}'
