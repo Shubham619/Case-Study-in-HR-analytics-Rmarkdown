@@ -1,5 +1,6 @@
+echo "index,read_MBps,write_MBps,total_MBps" > pcm_log.csv
 sudo pcm-memory 1 | grep --line-buffered -E "System (Read|Write|Memory) Throughput" | \
-awk -v OFS=" " '
-/Read/   {read=$NF}
-/Write/  {write=$NF}
-/Memory/ {total=$NF; n++; print n, "Read:", read, "Write:", write, "Total:", total >> "pcm_log.txt"; fflush("pcm_log.txt")}'
+awk -v OFS="," '
+/Read/   {r=$NF}
+/Write/  {w=$NF}
+/Memory/ {m=$NF; count+=1; print count, r, w, m >> "pcm_log.csv"; fflush("pcm_log.csv") }'
