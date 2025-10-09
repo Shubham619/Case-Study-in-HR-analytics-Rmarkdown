@@ -1,11 +1,12 @@
-./pcm-memory 1 | grep --line-buffered -E "System (Read|Write|Memory) Throughput" | \
-awk '
+echo "Index,Read(MB/s),Write(MB/s),Memory(MB/s)" > pcm_log.csv
+sudo pcm-memory 1 | grep --line-buffered -E "System (Read|Write|Memory) Throughput" | \
+awk -F':' '
 /Read/   {match($0, /([0-9]+\.[0-9]+)/, a); r=a[1]}
 /Write/  {match($0, /([0-9]+\.[0-9]+)/, a); w=a[1]}
 /Memory/ {
     match($0, /([0-9]+\.[0-9]+)/, a)
     m=a[1]
     count+=1
-    printf "%d ---| %s ---| %s ---| %s\n", count, r, w, m >> "pcm_log.txt"
-    fflush("pcm_log.txt")
+    printf "%d,%s,%s,%s\n", count, r, w, m >> "pcm_log.csv"
+    fflush("pcm_log.csv")
 }'
