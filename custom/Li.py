@@ -1,3 +1,119 @@
+#!/usr/bin/env python3
+import os, mmap, ctypes, math, numpy as np
+import pycuda.driver as cuda
+import pycuda.autoinit
+from pycuda.compiler import SourceModule
+
+# ---------------- Config ----------------
+CXL_REGION = os.environ.get("CXL_REGION", "/dev/cxl/region0")
+SYSFS_SIZE = f"/sys/bus/cxl/devices/{os.path.basename(CXL_REGION)}/size"
+# Choose a registration chunk that your system tolerates (try 2–8 GB).
+CHUNK_GB = int(os.environ.get("CXL_CHUNK_GB", "4"))
+TOUCH_MEMORY_FROM_GPU = True   # set False if you only want to map
+
+# --------------- Helpers ----------------
+def read_region_size_bytes():
+    # sysfs exposes size in bytes
+    with open(SYSFS_SIZE, "r") as f:
+        s = f.read().strip()
+    return int(s, 0) if s.startswith("0x") else int(s)
+
+def roundup(x, align):
+    return ((x + align - 1) // align) * align
+
+# --------------- Start ------------------
+total_size = read_region_size_bytes()
+chunk_size = CHUNK_GB * 1024**3
+print(f"[INFO] Region: {CXL_REGION}  size={total_size/1e9:.2f} GB  chunk={chunk_size/1e9:.2f} GB")
+
+# open + mmap the WHOLE region
+fd = os.open(CXL_REGION, os.O_RDWR)
+# mmap length must be page-aligned; total_size should already be aligned by kernel
+cxl_map = mmap.mmap(fd, total_size, mmap.MAP_SHARED, mmap.PROT_READ | mmap.PROT_WRITE)
+base_addr = ctypes.addressof(ctypes.c_char.from_buffer(cxl_map))
+print(f"[INFO] User VA of whole CXL region: 0x{base_addr:x}")
+
+# CUDA must allow mapping host memory
+device = cuda.Device(0)
+ctx = cuda.Context.attach()  # pycuda.autoinit already created one; attach to be safe
+attr = device.get_attributes()
+if not attr.get(cuda.device_attribute.CAN_MAP_HOST_MEMORY, 0):
+    raise RuntimeError("GPU cannot map host memory (CAN_MAP_HOST_MEMORY = 0).")
+
+# Prepare kernel to touch memory (optional)
+mod = SourceModule(r"""
+extern "C" __global__ void touch_u32(unsigned int *p, size_t words, unsigned int seed){
+    size_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < words) {
+        unsigned int v = (unsigned int)(i ^ seed);
+        p[i] = v;
+        // read back to force a load too
+        if ((p[i] ^ v) == 0xFFFFFFFF) { p[i] = v; }
+    }
+}
+""")
+touch = mod.get_function("touch_u32")
+
+# Walk the whole region in chunks: register → get device ptr → (optional) touch → unregister
+registered = []
+offset = 0
+i_chunk = 0
+try:
+    while offset < total_size:
+        length = min(chunk_size, total_size - offset)
+        host_ptr = base_addr + offset
+
+        # Register this window with DEVICEMAP so GPU can DMA to it
+        try:
+            cuda.mem_host_register(ctypes.c_void_p(host_ptr), length,
+                                   cuda.host_register_flags.DEVICEMAP)
+        except cuda.Error as e:
+            # If this fails (memlock/driver), try halving the chunk and continue
+            if length > (128 * 1024**2):
+                print(f"[WARN] Register {length/1e9:.2f} GB failed ({e}); retry smaller chunk.")
+                chunk_size = max(length // 2, 128 * 1024**2)
+                continue
+            raise
+
+        dptr = cuda.get_device_pointer(ctypes.c_void_p(host_ptr))
+        registered.append((offset, length, dptr))
+        print(f"[MAP] Chunk#{i_chunk:03d} off={offset/1e9:8.2f} GB  len={length/1e9:6.2f} GB  dptr=0x{int(dptr):x}")
+        i_chunk += 1
+        offset += length
+
+    print(f"[INFO] Registered {len(registered)} chunk(s), total {sum(l for _,l,_ in registered)/1e9:.2f} GB.")
+
+    if TOUCH_MEMORY_FROM_GPU:
+        # GPU-touch every chunk to prove end-to-end PCIe/CXL accessibility
+        threads = 256
+        for j, (off, length, dptr) in enumerate(registered):
+            words = length // 4
+            blocks = (words + threads - 1) // threads
+            seed = np.uint32(j * 2654435761 & 0xFFFFFFFF)
+
+            start, end = cuda.Event(), cuda.Event()
+            start.record()
+            touch(cuda.PseudoDevicePtr(dptr),
+                  np.uint64(words),
+                  seed,
+                  block=(threads,1,1),
+                  grid=(int(blocks),1,1))
+            end.record(); end.synchronize()
+            ms = start.time_till(end)
+            gbps = (length / 1e9) / (ms/1e3)  # approximate write+read touch bandwidth
+            print(f"[TOUCH] Chunk#{j:03d} {length/1e9:6.2f} GB in {ms:7.2f} ms  ~{gbps:6.1f} GB/s")
+
+finally:
+    # Always unregister in reverse order
+    for off, length, dptr in reversed(registered):
+        cuda.mem_host_unregister(ctypes.c_void_p(base_addr + off))
+    cxl_map.close()
+    os.close(fd)
+    print("[CLEANUP] Unregistered and unmapped.")
+
+
+
+
 import gc
 import psutil
 import torch
