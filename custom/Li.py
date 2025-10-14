@@ -1,5 +1,100 @@
 import matplotlib.pyplot as plt
 import numpy as np
+from matplotlib.ticker import LogLocator
+
+# ---------- Context lengths ----------
+context = np.array([64,128,256,512,1024,2048,4096,8192,16384,24576])
+
+# ---------- Prefill + Decode Latency ----------
+ddr_prefill = [4.56,5.28,5.98,8.27,12.88,26.15,55.51,174.12,np.nan,np.nan]
+cxl_prefill = [4.65,5.16,6.17,10.25,14.41,30.64,53.97,186.96,429.57,598.25]
+ddr_decode  = [110.55,112.08,109.54,116.86,118.7,134.3,224.82,352.08,np.nan,np.nan]
+cxl_decode  = [130.26,130.23,133.08,136.5,141.97,179.26,218.63,368.0,488.13,639.02]
+
+lat_ddr = np.array(ddr_prefill) + np.array(ddr_decode)
+lat_cxl = np.array(cxl_prefill) + np.array(cxl_decode)
+
+oom_indices = [i for i, v in enumerate(lat_ddr) if np.isnan(v)]
+
+# ---------- (a) Prefill + Decode Latency ----------
+plt.figure(figsize=(6.5,4))
+plt.plot(context, lat_ddr, 'o-', color='#1f77b4', label='DDR Total Latency')
+plt.plot(context, lat_cxl, 's--', color='#ff7f0e', label='CXL Total Latency')
+plt.xscale('log', base=2)
+plt.gca().xaxis.set_major_locator(LogLocator(base=2, numticks=20))
+plt.xlabel("Context Length (tokens)")
+plt.ylabel("Latency (s)")
+plt.title("(a) Prefill + Decode Latency vs Context Length")
+plt.grid(True, which='both', linestyle='--', alpha=0.6)
+for i in oom_indices:
+    plt.scatter(context[i], 0, color='red', marker='x', s=80, label='OOM' if i==oom_indices[0] else "")
+    plt.text(context[i]*1.05, 5, 'OOM', color='red', fontsize=9, rotation=0)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ---------- (b) Peak RAM ----------
+ddr_ram = [42,44,48,53,59,66,77,92,np.nan,np.nan]
+cxl_ram = [44,46,50,55,60,70,78,86,110,132]
+oom_indices_ram = [i for i, v in enumerate(ddr_ram) if np.isnan(v)]
+
+plt.figure(figsize=(6.5,4))
+plt.plot(context, ddr_ram, 'o-', color='#1f77b4', label='DDR Peak RAM')
+plt.plot(context, cxl_ram, 's--', color='#ff7f0e', label='CXL Peak RAM')
+plt.xscale('log', base=2)
+plt.gca().xaxis.set_major_locator(LogLocator(base=2, numticks=20))
+plt.xlabel("Context Length (tokens)")
+plt.ylabel("Peak RAM (GB)")
+plt.title("(b) Peak RAM Usage vs Context Length")
+plt.grid(True, which='both', linestyle='--', alpha=0.6)
+for i in oom_indices_ram:
+    plt.scatter(context[i], 40, color='red', marker='x', s=80, label='OOM' if i==oom_indices_ram[0] else "")
+    plt.text(context[i]*1.05, 45, 'OOM', color='red', fontsize=9)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ---------- (c) Prefill TPOT ----------
+tpot_ddr = context / np.array(ddr_prefill)
+tpot_cxl = context / np.array(cxl_prefill)
+oom_indices_tpot = [i for i, v in enumerate(tpot_ddr) if np.isnan(v)]
+
+plt.figure(figsize=(6.5,4))
+plt.plot(context, tpot_ddr, 'o-', color='#1f77b4', label='DDR TPOT')
+plt.plot(context, tpot_cxl, 's--', color='#ff7f0e', label='CXL TPOT')
+plt.xscale('log', base=2)
+plt.gca().xaxis.set_major_locator(LogLocator(base=2, numticks=20))
+plt.xlabel("Context Length (tokens)")
+plt.ylabel("Prefill TPOT (tokens/sec)")
+plt.title("(c) Prefill TPOT vs Context Length")
+plt.grid(True, which='both', linestyle='--', alpha=0.6)
+for i in oom_indices_tpot:
+    plt.scatter(context[i], 0, color='red', marker='x', s=80, label='OOM' if i==oom_indices_tpot[0] else "")
+    plt.text(context[i]*1.05, np.nanmax(tpot_cxl)*0.05, 'OOM', color='red', fontsize=9)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ---------- (d) ROI ----------
+roi = tpot_cxl / tpot_ddr
+oom_indices_roi = [i for i, v in enumerate(roi) if np.isnan(v)]
+
+plt.figure(figsize=(6.5,4))
+plt.plot(context, roi, 's--', color='#9467bd', label='ROI = Offload / Baseline TPOT')
+plt.axhline(1.0, color='gray', linestyle='--', linewidth=1)
+plt.xscale('log', base=2)
+plt.gca().xaxis.set_major_locator(LogLocator(base=2, numticks=20))
+plt.xlabel("Context Length (tokens)")
+plt.ylabel("ROI Ratio")
+plt.title("(d) ROI vs Context Length")
+plt.grid(True, which='both', linestyle='--', alpha=0.6)
+for i in oom_indices_roi:
+    plt.scatter(context[i], 1, color='red', marker='x', s=80, label='OOM' if i==oom_indices_roi[0] else "")
+    plt.text(context[i]*1.05, 1.1, 'OOM', color='red', fontsize=9)
+plt.legend()
+plt.tight_layout()
+plt.show()import matplotlib.pyplot as plt
+import numpy as np
 
 # ---------------- Context lengths ----------------
 context = np.array([64,128,256,512,1024,2048,4096,8192,16384])
