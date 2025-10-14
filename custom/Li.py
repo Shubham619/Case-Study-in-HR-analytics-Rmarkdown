@@ -1,3 +1,82 @@
+import matplotlib.pyplot as plt
+import numpy as np
+
+# ---------------- Context lengths ----------------
+context = np.array([64,128,256,512,1024,2048,4096,8192,16384])
+
+# ---------------- (a) Prefill + Decode Latency ----------------
+ddr_prefill = [4.56,5.28,5.98,8.27,12.88,26.15,55.51,174.12,np.nan]
+cxl_prefill = [4.65,5.16,6.17,10.25,14.41,30.64,53.97,186.96,429.57]
+ddr_decode = [110.55,112.08,109.54,116.86,118.7,134.3,224.82,352.08,np.nan]
+cxl_decode = [130.26,130.23,133.08,136.5,141.97,179.26,218.63,368.0,488.13]
+
+lat_ddr = np.array(ddr_prefill) + np.array(ddr_decode)
+lat_cxl = np.array(cxl_prefill) + np.array(cxl_decode)
+
+plt.figure(figsize=(6.5,4))
+plt.plot(context, lat_ddr, 'o-', color='#1f77b4', label='DDR Total Latency')
+plt.plot(context, lat_cxl, 's--', color='#ff7f0e', label='CXL Total Latency')
+plt.xscale('log', base=2)
+plt.xlabel("Context Length (tokens)")
+plt.ylabel("Latency (s)")
+plt.title("(a) Prefill + Decode Latency vs Context Length")
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ---------------- (b) Peak RAM Usage ----------------
+ddr_ram = [42,44,48,53,59,66,77,92,np.nan]   # Example DDR growth pattern
+cxl_ram = [44,46,50,55,60,70,78,86,110]      # Scales with CXL usage
+
+plt.figure(figsize=(6.5,4))
+plt.plot(context, ddr_ram, 'o-', color='#1f77b4', label='DDR Peak RAM')
+plt.plot(context, cxl_ram, 's--', color='#ff7f0e', label='CXL Peak RAM')
+plt.xscale('log', base=2)
+plt.xlabel("Context Length (tokens)")
+plt.ylabel("Peak RAM (GB)")
+plt.title("(b) Peak RAM Usage vs Context Length")
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ---------------- (c) Prefill TPOT ----------------
+# Throughput per token (tokens/sec = context_len / time)
+tpot_ddr = context / np.array(ddr_prefill)
+tpot_cxl = context / np.array(cxl_prefill)
+
+plt.figure(figsize=(6.5,4))
+plt.plot(context, tpot_ddr, 'o-', color='#1f77b4', label='DDR TPOT')
+plt.plot(context, tpot_cxl, 's--', color='#ff7f0e', label='CXL TPOT')
+plt.xscale('log', base=2)
+plt.xlabel("Context Length (tokens)")
+plt.ylabel("Prefill TPOT (tokens/sec)")
+plt.title("(c) Prefill TPOT vs Context Length")
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+# ---------------- (d) ROI (Offload / Baseline TPOT) ----------------
+roi = tpot_cxl / tpot_ddr
+
+plt.figure(figsize=(6.5,4))
+plt.plot(context, roi, 's--', color='#9467bd', label='ROI = Offload / Baseline TPOT')
+plt.axhline(1.0, color='gray', linestyle='--', linewidth=1)
+plt.xscale('log', base=2)
+plt.xlabel("Context Length (tokens)")
+plt.ylabel("ROI Ratio")
+plt.title("(d) ROI vs Context Length")
+plt.grid(True, linestyle='--', alpha=0.6)
+plt.legend()
+plt.tight_layout()
+plt.show()
+
+
+
+
+
 #!/usr/bin/env python3
 import os, mmap, ctypes, math, numpy as np
 import pycuda.driver as cuda
