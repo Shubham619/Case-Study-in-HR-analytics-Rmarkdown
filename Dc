@@ -1,0 +1,150 @@
+Background – Slide 1: Transformer Workloads and Memory Pressure
+	•	Modern transformer models used in GenAI inference and training are dominated by large matrix multiplications at every layer and token step.
+	•	Each step requires access to large weight matrices, activations, KV cache, and (during training) optimizer state.
+	•	Fast local memory on accelerators (such as HBM or on-chip SRAM) provides high bandwidth but is limited in capacity.
+	•	As model sizes grow, the complete working set can no longer remain resident in fast local memory.
+
+⸻
+
+Background – Slide 2: Reliance on Pooled / Shared Memory
+	•	To overcome local memory limits, systems increasingly rely on pooled or shared memory tiers, such as peer accelerator memory, host DRAM, memory appliances, or disaggregated memory fabrics.
+	•	These pooled memory tiers have higher access latency, lower effective bandwidth, and are often shared across multiple accelerators or tenants.
+	•	Access latency and contention in pooled memory vary dynamically, making data arrival times unpredictable.
+	•	Naïve movement of entire layers or large contiguous chunks from pooled memory leads to inefficient bandwidth use.
+
+⸻
+
+Background – Slide 3: Limitations of Existing Approaches
+	•	Existing systems typically move weights at coarse granularity (entire layers or large blocks), causing overfetch and unnecessary data transfer.
+	•	When required data arrives late, compute engines stall, increasing tail latency during inference and reducing utilization during training.
+	•	Prefetching mechanisms are usually best-effort and cache-oriented, without explicit deadlines or cancellation when data is no longer useful.
+	•	Most approaches require full dense weights to be locally present before computation, limiting overlap between compute and memory transfer.
+
+⸻
+
+Background – Slide 4: Additional Challenges in Distributed and Training Settings
+	•	In distributed inference, multiple accelerators may fetch the same data redundantly due to lack of coordination, wasting pooled-memory bandwidth.
+	•	Training introduces stricter correctness constraints, requiring all needed parameters and optimizer state to be present before backward propagation or synchronization.
+	•	Current systems lack a unified mechanism to balance bandwidth across weights, KV cache growth, and optimizer state under shared constraints.
+	•	These challenges motivate a new execution model that allows computation to proceed with partial data, while ensuring bounded latency, efficient bandwidth use, and deterministic correctness.
+
+
+flowchart TB
+X[Input tokens] --> E[Embedding]
+E --> L1[Transformer Block 1\nAttention GEMM + MLP GEMM]
+L1 --> L2[Transformer Block 2\nAttention GEMM + MLP GEMM]
+L2 --> L3[Transformer Block 3\nAttention GEMM + MLP GEMM]
+L3 --> O[Output logits]
+
+W[Weights\n(Wq,Wk,Wv,Wout,W1,W2)] --> L1
+W --> L2
+W --> L3
+
+KV[KV Cache\n(grows per token)] --> L1
+KV --> L2
+KV --> L3
+
+
+
+flowchart LR
+GPU[Accelerator] --> HBM[Fast Local Memory\n(HBM / SRAM)\nHigh BW, Small]
+GPU --> CE[Compute Engines\nGEMMs]
+
+HBM -->|cannot fit full working set| MISS[Capacity Pressure]
+
+MISS --> POOL[Pooled/Shared Memory Tier\n(peer GPU mem / host DRAM /\nappliance / fabric)]
+POOL -->|higher latency\nlower effective BW\ncontention| HBM
+
+
+
+
+flowchart LR
+G1[GPU / Accelerator 1\nFast Local Memory] --> FAB[Interconnect / Fabric]
+G2[GPU / Accelerator 2\nFast Local Memory] --> FAB
+G3[GPU / Accelerator 3\nFast Local Memory] --> FAB
+
+FAB --> POOL[Pooled/Shared Memory\n(peer memory / host DRAM /\nappliance / disaggregated fabric)]
+
+
+
+
+
+
+flowchart TB
+POOL[Pooled/Shared Memory] --> Q[Shared Queue / Bottleneck]
+G1[GPU 1] -->|fetch| Q
+G2[GPU 2] -->|fetch| Q
+G3[GPU 3] -->|fetch| Q
+Q -->|variable service time| OUT[Variable latency\nand bandwidth]
+
+
+flowchart LR
+L[Fast Local Memory\nHigh BW, Low Latency] --> C[Compute]
+P[Pooled/Shared Memory\nLower BW, Higher Latency] --> C
+
+note1[Local access is predictable] --- L
+note2[Pooled access is variable and contended] --- P
+
+
+
+flowchart LR
+NEED[Needed now:\nsmall subset] --> USE[Compute uses subset]
+
+FETCH[Fetch whole layer\n(large chunk)] --> HBM[HBM Buffer]
+HBM --> USE
+
+FETCH --> WASTE[Overfetch:\nextra bytes moved\nnot needed now]
+
+
+
+flowchart TB
+A[Time] --> B[Fetch Full Layer\nRemote/Pooled]
+B --> C[STALL:\nCompute waits for data]
+C --> D[Compute Layer]
+D --> E[Next Layer]
+
+
+
+flowchart LR
+T[Timeline] --> S1[Big Transfer Burst]
+S1 --> S2[Idle / low transfer]
+S2 --> S3[Big Transfer Burst]
+S3 --> S4[Idle / low transfer]
+
+S1 --> BW1[Bandwidth spike]
+S3 --> BW2[Bandwidth spike]
+
+
+flowchart LR
+POOL[Pooled/Shared Memory\nWeights] -->|same tile fetched| G1[GPU 1]
+POOL -->|same tile fetched| G2[GPU 2]
+POOL -->|same tile fetched| G3[GPU 3]
+
+G1 --> R[Redundant transfers]
+G2 --> R
+G3 --> R
+
+
+
+
+flowchart LR
+FWD[Forward Pass] --> BWD[Backward Pass]
+BWD --> SYNC[Sync / All-reduce Barrier]
+SYNC --> UPD[Optimizer Update]
+
+DATA[Remote/Pooled fetch] -->|late arrival| SYNC
+SYNC --> WAIT[If missing data,\nbarrier stalls]
+
+
+
+
+flowchart TB
+W[Weights] --> MEM[Working Set]
+ACT[Activations] --> MEM
+KV[KV Cache] --> MEM
+OPT[Optimizer State\n(moments, etc.)] --> MEM
+
+MEM --> PRESS[Exceeds fast memory capacity]
+PRESS --> POOL[Pooled/Shared Memory used for capacity]
+
+
