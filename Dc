@@ -148,3 +148,262 @@ MEM --> PRESS[Exceeds fast memory capacity]
 PRESS --> POOL[Pooled/Shared Memory used for capacity]
 
 
+
+Below is a complete, verbose, end-to-end “Detailed Description” story (spec-style) that explicitly includes your math and walks through the full operation (F1–F16) in the order a machine actually performs it. I’m treating “pooled/shared memory” as any pooling facility (peer accelerator memory, host DRAM, appliance, disaggregated fabric, etc.).
+
+⸻
+
+Detailed Description of the Invention (Complete Story with Math)
+
+0) System context and components
+
+The system comprises one or more accelerators (processors) with:
+	1.	Fast local memory (e.g., HBM or any low-latency high-bandwidth local memory),
+	2.	Pooled/shared memory tier providing large capacity but with higher latency and lower effective bandwidth, often contended,
+	3.	Compute engines for matrix operations,
+	4.	A managed tile cache in fast local memory,
+	5.	A tile directory (local or distributed) that tracks tile location/version/in-flight status,
+	6.	A scheduler/arbiter that enforces per-step traffic budgets and priorities across transfer classes (weights, optional KV/state, optimizer),
+	7.	Runtime telemetry (measured bandwidth, queue depth, latency statistics) used for ETA prediction and control,
+	8.	Optional learning module to update tile scoring based on observed outcomes.
+
+⸻
+
+1) Offline or load-time preparation: cross-tier decomposition (F1)
+
+For each transformer dense layer weight matrix W \in \mathbb{R}^{m\times n}, the system produces a cross-tier representation:
+W = B + UV^\top,
+\quad
+B\in\mathbb{R}^{m\times n},\
+U\in\mathbb{R}^{m\times r},\
+V\in\mathbb{R}^{n\times r}.
+Here:
+	•	B is the base component chosen to remain resident in fast local memory to guarantee immediate compute start.
+	•	U,V are low-rank factors stored in pooled/shared memory to provide capacity scaling.
+
+The rank r can be chosen per layer, based on a memory budget and acceptable residual error (for example, selecting r such that the base captures most energy while leaving the remainder expressible as rank-slices).
+
+This step ensures the system never requires full dense W to be fetched into fast memory.
+
+⸻
+
+2) Tile formation: addressable rank-slices (F2)
+
+To make the pooled portion fine-grained and individually retrievable, the system expresses the low-rank term as rank-slices:
+UV^\top x = \sum_{i=1}^{r} u_i\,(v_i^\top x),
+where u_i is the i-th column of U and v_i is the i-th column of V.
+
+Each slice i becomes a rank-slice tile:
+	•	payload: (u_i, v_i) (possibly quantized/compressed),
+	•	metadata: \text{tile\_id}, bytes, version, location pointers, optional importance order, and transform descriptors.
+
+The system stores B in fast local memory (or ensures it can be quickly pinned there at model load), and stores tiles (u_i,v_i) in pooled/shared memory.
+
+⸻
+
+3) Managed tile cache and selective staging policy (F3)
+
+The system reserves a region in fast local memory as an HBM/local tile cache.
+This cache is explicitly managed: tiles are staged into it only when selected. The cache is typically sized to hold only a small fraction of all tiles per layer, so the system is forced to be selective and budget-driven rather than “fetch everything.”
+
+⸻
+
+4) Per-step control: traffic budget and deadline definition (F4, F5)
+
+Execution proceeds in steps (per token, per layer, or both). For each step, the system defines a commit goal:
+	•	Deadline T: commit must happen no later than time T for that step.
+	•	Traffic budget B_{\text{bytes}}: maximum bytes allowed to be staged or in-flight during the step.
+Optionally, the budget can be partitioned into classes (e.g., UV tiles vs optional KV/state vs optimizer-state tiles), but the essential requirement is that transfers remain within a bounded budget to avoid spikes and contention amplification.
+
+This is the core mechanism that keeps execution predictable under pooled-memory variability.
+
+⸻
+
+5) Immediate base compute: provisional output starts without waiting (F10 foundation)
+
+Given input activation x\in\mathbb{R}^{n}, the system immediately computes:
+y_0 = Bx.
+This is done entirely from fast local memory and therefore does not depend on pooled-memory arrival.
+
+As tiles arrive, the system incrementally refines:
+y_k = y_0 + \sum_{i\in S_k} u_i\,(v_i^\top x),
+where S_k denotes the set of tiles that have arrived and have been applied so far.
+
+This equation is the non-materializing execution form: no dense W is reconstructed, and Bx is computed once.
+
+⸻
+
+6) Quality signals computed during the step (F6)
+
+From the current provisional output (typically logits in inference), the system computes a stability margin:
+m = p(\text{top1}) - p(\text{top2}),
+which measures how confident the step’s decision is (larger m indicates more stable next-token choice).
+
+The system also computes an error proxy over missing tiles. Let:
+M = \{1,\dots,r\}\setminus S_k
+be the missing tiles not yet applied. Then:
+E = \sum_{i\in M} \|u_i\|\cdot |v_i^\top x|.
+Interpretation: E is a proxy upper bound on the remaining additive contribution from tiles that have not yet been fetched/applied. It can be used as a stopping certificate: when E is small, missing tiles are unlikely to change the output meaningfully.
+
+⸻
+
+7) Commit/stop rule (F5, F6)
+
+The system commits output for the step under the following rule:
+\text{Commit if }(m\ge \tau)\ \text{or }(E\le \varepsilon)\ \text{or }(t\ge T),
+where \tau is a stability threshold, \varepsilon is an error tolerance, and t is the current time.
+
+This rule ensures:
+	•	early commit when decision is stable,
+	•	commit when residual uncertainty is bounded,
+	•	guaranteed commit by deadline T.
+
+⸻
+
+8) Candidate tile construction and benefit-per-byte scoring (F7)
+
+If commit conditions are not met and budget/time remains, the system forms a candidate set of missing tiles and scores each by expected benefit per byte:
+
+\text{score}_i \approx \frac{\Delta m_i}{\text{bytes}_i}
+\quad\text{and/or}\quad
+\frac{\Delta E_i}{\text{bytes}_i}.
+
+A practical proxy for error reduction is:
+\Delta E_i \approx \|u_i\|\cdot |v_i^\top x|,
+leading to a simple scoring rule:
+\text{score}_i = \frac{\|u_i\|\cdot |v_i^\top x|}{\text{bytes}_i}.
+
+In implementations, the system may avoid computing v_i^\top x for all tiles by using inexpensive predictors, cached projections, or previously observed counterfactual values. The objective is to rank tiles by expected impact per transferred byte.
+
+⸻
+
+9) Joint set selection under budget (F8)
+
+Rather than selecting tiles independently, the system performs joint selection using a tile-dependency graph. Nodes represent tiles; edges encode:
+	•	co-use: tiles often valuable together,
+	•	contention coupling: tiles share bottlenecks (same link, same queue, same transform engine),
+	•	redundancy/substitution: overlapping effects where selecting both provides diminishing returns.
+
+Tile selection produces a set S^\* that satisfies the budget:
+\sum_{i\in S^\*}\text{bytes}_i \le B_{\text{bytes}},
+and maximizes total expected benefit under that constraint.
+
+The scoring can be implemented with heuristics or an optional GNN that outputs joint set scores rather than independent scores.
+
+⸻
+
+10) Deadline-constrained prefetch with use-by and telemetry control (F9)
+
+For each selected tile, the system issues a request carrying expiration metadata:
+\text{req} = (\text{tile\_id},\ \text{priority},\ \text{use\_by\_t},\ \text{consumer\_layer}).
+
+During execution, telemetry estimates the expected arrival time \widehat{ETA}_i. If:
+\widehat{ETA}_i > \text{use\_by\_t},
+the request is canceled or demoted, and its reserved bandwidth budget is reallocated to other tiles.
+
+This prevents spending bandwidth on tiles that cannot affect the committed output and reduces bandwidth spikes caused by late, useless transfers.
+
+⸻
+
+11) Transform-on-arrival into microkernel layout (F15)
+
+Tiles may be stored in pooled memory in compressed/quantized form. When a tile arrives in the fast local tile cache, the system immediately applies transform-on-arrival, such as:
+	•	dequantization,
+	•	decompression,
+	•	transpose,
+	•	packing/swizzle into microkernel-preferred layout.
+
+This ensures the compute engine can consume the tile without further stalls and makes “arrival” effectively mean “ready to apply.”
+
+⸻
+
+12) Non-materializing accumulation and application (F10)
+
+As each tile becomes ready, the system applies it by computing:
+s_i = v_i^\top x,\qquad y \leftarrow y + u_i \cdot s_i.
+This is done without rebuilding W, and without recomputing Bx. The output is continuously improved as tiles arrive until the commit rule triggers.
+
+⸻
+
+13) Latency hiding / stall reduction math (F5 + F10 as performance rationale)
+
+Let:
+	•	t_B be the time to compute Bx locally,
+	•	t_F be the time until the selected tile set arrives ready-to-use (including transfer + transform + queueing),
+	•	t_S be stall time waiting for tiles.
+
+Because base compute overlaps fetch, the stall time becomes:
+t_S = \max(0,\ t_F - t_B).
+If t_B \ge t_F, stall is fully eliminated (t_S=0).
+
+A slide-friendly latency hiding ratio is:
+\text{HideRatio} = \frac{\min(t_B,\ t_F)}{t_F},
+where HideRatio =1 indicates full hiding, and values closer to 0 indicate poor overlap.
+
+This provides a direct quantitative way to claim reduced GPU stall time.
+
+⸻
+
+14) Deterministic refinement contract (F11)
+
+After the system commits output, additional tiles may still arrive. These late tiles are not used to re-run base compute; they are applied as deterministic deltas:
+y \leftarrow y + u_i(v_i^\top x).
+To guarantee determinism and prevent duplication, each tile is tracked using:
+	•	a tile version number,
+	•	an applied-bitset (or equivalent applied state).
+
+Applying the same tile twice is prevented (idempotence), and because contributions are additive, the refinement updates are commutative (order-independent). Outputs can be tagged with a refinement version describing which tiles were included.
+
+⸻
+
+15) Counterfactual value learning loop (F12)
+
+After commit, the system can compute a more refined reference output (from late arrivals or background completion). For each tile i, it computes a counterfactual value signal such as:
+	•	\Deltalogit-KL between committed and refined outputs,
+	•	improvement in stability margin \Delta m,
+	•	or reduction in proxy error.
+
+These signals become training labels to update the tile scoring mechanism, so future steps fetch tiles that historically provided the most benefit per byte in similar contexts.
+
+⸻
+
+16) Multi-accelerator tile directory, deduplication, multicast, fairness (F13)
+
+In multi-accelerator environments, a directory tracks:
+\text{tile\_id} \rightarrow \{\text{location(s)},\ \text{version},\ \text{in-flight}\}.
+When a tile is already present on a peer accelerator, or already in multicast flight, the system avoids redundant pulls from pooled memory. Fairness throttling prevents one accelerator or tenant from monopolizing pooled bandwidth.
+
+This directly reduces contention-induced variability and improves predictability of fetch completion.
+
+⸻
+
+17) Training-consistent mode with optimizer-state tiles (F14)
+
+In training mode, the forward path can use the same split execution, but correctness requires that tiles needed for exact gradients are available before backward/synchronization. If t_{\text{bwd}} is the backward start time for a layer, the system enforces:
+t_{\text{tile\_ready}} \le t_{\text{bwd}}.
+Similarly, optimizer-state tiles (e.g., moments) are fetched so they are present for the optimizer update. Tile updates and optimizer-state updates are written back with version increments, without materializing dense W.
+
+⸻
+
+18) Unified arbitration across transfer classes (F16)
+
+A unified arbiter manages the shared traffic budget among:
+	•	UV rank-slice tiles,
+	•	optimizer-state tiles (training),
+	•	and optionally KV/runtime state transfers.
+
+This prevents one class from starving another under shared bandwidth constraints and keeps transfer behavior bounded and predictable.
+
+⸻
+
+Closing statement (what the system achieves)
+
+By combining F1–F16, the system guarantees immediate compute progress via Bx, overlaps pooled-memory transfers with compute to reduce stall time t_S=\max(0,t_F-t_B), commits outputs by deadline using explicit quality gates, and refines deterministically while maintaining multi-accelerator efficiency and training correctness, all without materializing dense weights in fast local memory.
+
+⸻
+
+If you want, I can now convert this verbatim into:
+	•	a 5-slide PPT-ready script (title + bullet layout + speaker notes), or
+	•	a patent-spec format with numbered paragraphs [0001], [0002], etc.
+
+
