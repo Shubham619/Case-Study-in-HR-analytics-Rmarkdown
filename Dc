@@ -407,3 +407,128 @@ If you want, I can now convert this verbatim into:
 	•	a patent-spec format with numbered paragraphs [0001], [0002], etc.
 
 
+
+
+Explanation of the flowchart (Inference vs Training)
+
+Start & mode split
+
+The flow begins at a token/layer step and immediately branches by Mode: Inference or Training.
+
+Shared core (both modes)
+
+Both paths compute the base first: 
+𝑦
+0
+=
+𝐵
+𝑥
+y
+0
+	​
+
+=Bx from fast local memory.
+
+As rank-slice tiles arrive, both paths update output without rebuilding 
+𝑊
+W:
+
+𝑦
+=
+𝐵
+𝑥
++
+∑
+𝑢
+𝑖
+(
+𝑣
+𝑖
+⊤
+𝑥
+)
+y=Bx+∑u
+i
+	​
+
+(v
+i
+⊤
+	​
+
+x).
+
+Inference path (commit-by-deadline)
+
+After provisional compute, the system computes quality signals:
+
+stability margin 
+𝑚
+=
+𝑝
+(
+top1
+)
+−
+𝑝
+(
+top2
+)
+m=p(top1)−p(top2)
+
+error proxy 
+𝐸
+=
+∑
+∥
+𝑢
+𝑖
+∥
+⋅
+∣
+𝑣
+𝑖
+⊤
+𝑥
+∣
+E=∑∥u
+i
+	​
+
+∥⋅∣v
+i
+⊤
+	​
+
+x∣ for missing tiles
+
+It commits when 
+𝑚
+≥
+𝜏
+m≥τ or 
+𝐸
+≤
+𝜀
+E≤ε or time ≥ 
+𝑇
+T.
+
+If not ready, it selects more tiles under the byte budget, issues prefetches with use-by times, and cancels any fetch whose predicted ETA > use-by.
+
+After commit, late tiles can apply deterministic refinement (versioned, idempotent).
+
+Training path (must-complete)
+
+Training identifies the required tiles for exact gradients and required optimizer-state tiles.
+
+It prioritizes fetching these tiles to satisfy a must-complete window before backward/sync (no “commit early” rule).
+
+If required tiles aren’t ready, it continues fetching/reprioritizing until they are.
+
+Once ready, it runs backward + sync, performs optimizer update, writes back updated tiles/state with a version bump, and ends the step.
+
+Short PPT summary (2 lines)
+
+Inference: Commit-by-deadline using quality gates (stability/error), fetching only high-value tiles with use-by cancellation to bound tail latency.
+Training: Must-complete mode guarantees exact gradients by ensuring required weight/optimizer tiles arrive before backward/sync, then updates and writes back versioned tiles.
