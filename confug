@@ -59,3 +59,15 @@ g++ -shared -fPIC -o libramulator_wrapper.so \
     -Wl,-rpath,$(pwd)/ramulator2/build/src \
     -Wl,-rpath,$(pwd)/ramulator2/build \
     -O3
+
+
+g++ -shared -fPIC -o libramulator_wrapper.so \
+    src/wrapper.cpp \
+    -I ramulator2/src \
+    -L ramulator2/build \
+    -L ramulator2/build/src \
+    -lramulator2 \
+    -Wl,-rpath,$(pwd)/ramulator2/build/src \
+    -Wl,-rpath,$(pwd)/ramulator2/build \
+    -O3
+
