@@ -1,17 +1,42 @@
 #!/bin/bash
 set -e
 
-echo "=== 1. PREPARING RAMULATOR ==="
-# Fix CMakeLists to force library creation
-sed -i 's/add_executable(ramulator2/add_library(ramulator2 SHARED/g' ramulator2/src/CMakeLists.txt
+echo "=== UNIFIED BUILD STARTING ==="
 
-echo "=== 2. BUILDING RAMULATOR CORE ==="
+# 1. Clean Slate
+rm -rf ramulator2
+git clone https://github.com/CMU-SAFARI/ramulator2.git
 cd ramulator2
+git submodule update --init --recursive
+
+# 2. Copy YOUR wrapper code into THEIR source folder
+# (We assume your wrapper is at ../src/wrapper.cpp)
+cp ../src/wrapper.cpp src/wrapper_integrated.cpp
+
+echo "=== PATCHING CMAKE TO BUILD EVERYTHING ==="
+
+# 3. Create a CMake target that compiles Ramulator AND your wrapper together
+cat <<EOF >> src/CMakeLists.txt
+
+# --- UNIFIED BUILD TARGET ---
+# Gather all C++ files in the source tree
+file(GLOB_RECURSE ALL_SRCS "*.cpp")
+# Remove main.cpp so it doesn't conflict
+list(FILTER ALL_SRCS EXCLUDE REGEX "main.cpp")
+
+# Create ONE shared library containing EVERYTHING
+add_library(ramulator_wrapper SHARED \${ALL_SRCS})
+
+# Link dependencies (YAML, spdlog)
+target_link_libraries(ramulator_wrapper PUBLIC yaml-cpp spdlog::spdlog)
+target_include_directories(ramulator_wrapper PUBLIC \${CMAKE_CURRENT_SOURCE_DIR})
+EOF
+
+# 4. Compile
 mkdir -p build
 cd build
-rm -rf * # Clean old bad build
 
-# Run CMake pointing to Conda env
+echo "=== COMPILING (This takes a minute) ==="
 cmake .. \
     -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
     -DCMAKE_BUILD_TYPE=Release \
@@ -21,29 +46,15 @@ cmake .. \
 
 make -j$(nproc)
 
-echo "=== 3. VERIFYING LIBRARY ==="
-# Find where the library actually landed
-LIB_FILE=$(find . -name "libramulator2.so")
+# 5. Deliver the result
+echo "=== FINISHING UP ==="
+# Find the file wherever CMake put it
+LIB_FILE=$(find . -name "libramulator_wrapper.so")
 
-if [ -z "$LIB_FILE" ]; then
-    echo "❌ Build failed. Library still not found."
+if [ -f "$LIB_FILE" ]; then
+    cp "$LIB_FILE" ../../libramulator_wrapper.so
+    echo "🎉 SUCCESS! The library is now in your main folder: libramulator_wrapper.so"
+else
+    echo "❌ Build failed. Please copy the error message above."
     exit 1
 fi
-
-LIB_PATH=$(realpath $LIB_FILE)
-LIB_DIR=$(dirname $LIB_PATH)
-echo "✅ Library created at: $LIB_PATH"
-
-cd ../.. # Go back to main folder
-
-echo "=== 4. BUILDING WRAPPER ==="
-# Now we link using the EXACT path we just found
-g++ -shared -fPIC -o libramulator_wrapper.so \
-    src/wrapper.cpp \
-    -I ramulator2/src \
-    "$LIB_PATH" \
-    -I "$CONDA_PREFIX/include" \
-    -Wl,-rpath,"$LIB_DIR" \
-    -O3
-
-echo "🎉 SUCCESS! Created: $(pwd)/libramulator_wrapper.so"
