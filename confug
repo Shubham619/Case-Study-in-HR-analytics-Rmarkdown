@@ -1,0 +1,21 @@
+mkdir -p configs
+cat <<EOF > configs/ddr4_config.yaml
+MemorySystem:
+  impl: GenericMemorySystem
+  DRAM:
+    impl: DDR4
+    org:
+      preset: DDR4_8Gb_x8
+      channel: 1
+      rank: 1
+    timing:
+      preset: DDR4_2400R
+    voltage:
+      preset: DDR4_1_2V
+  Controller:
+    impl: Generic
+    Scheduler:
+      impl: FCFS
+    RefreshManager:
+      impl: AllBank
+EOF
