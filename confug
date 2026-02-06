@@ -1,73 +1,49 @@
-mkdir -p configs
-cat <<EOF > configs/ddr4_config.yaml
-MemorySystem:
-  impl: GenericMemorySystem
-  DRAM:
-    impl: DDR4
-    org:
-      preset: DDR4_8Gb_x8
-      channel: 1
-      rank: 1
-    timing:
-      preset: DDR4_2400R
-    voltage:
-      preset: DDR4_1_2V
-  Controller:
-    impl: Generic
-    Scheduler:
-      impl: FCFS
-    RefreshManager:
-      impl: AllBank
-EOF
+#!/bin/bash
+set -e
 
-# 1. Find the specific name of the Conda compiler (it won't be called just 'g++')
-COMPILER=$(find $CONDA_PREFIX/bin -name "*-g++" | head -n 1)
+echo "=== 1. PREPARING RAMULATOR ==="
+# Fix CMakeLists to force library creation
+sed -i 's/add_executable(ramulator2/add_library(ramulator2 SHARED/g' ramulator2/src/CMakeLists.txt
 
-if [ -z "$COMPILER" ]; then
-    echo "❌ Compiler not found in Conda!"
-    echo "Please run: conda install -y -c conda-forge gxx_linux-64"
+echo "=== 2. BUILDING RAMULATOR CORE ==="
+cd ramulator2
+mkdir -p build
+cd build
+rm -rf * # Clean old bad build
+
+# Run CMake pointing to Conda env
+cmake .. \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" \
+    -DCMAKE_INCLUDE_PATH="$CONDA_PREFIX/include" \
+    -DCMAKE_LIBRARY_PATH="$CONDA_PREFIX/lib"
+
+make -j$(nproc)
+
+echo "=== 3. VERIFYING LIBRARY ==="
+# Find where the library actually landed
+LIB_FILE=$(find . -name "libramulator2.so")
+
+if [ -z "$LIB_FILE" ]; then
+    echo "❌ Build failed. Library still not found."
     exit 1
 fi
 
-echo "✅ Using compiler: $COMPILER"
+LIB_PATH=$(realpath $LIB_FILE)
+LIB_DIR=$(dirname $LIB_PATH)
+echo "✅ Library created at: $LIB_PATH"
 
-# 2. Run the build using that specific compiler
-"$COMPILER" -shared -fPIC -o libramulator_wrapper.so \
-    src/wrapper.cpp \
-    -I ramulator2/src \
-    -L ramulator2/build \
-    -L ramulator2/build/src \
-    -lramulator2 \
-    -Wl,-rpath,$(pwd)/ramulator2/build/src \
-    -O3
+cd ../.. # Go back to main folder
 
-# 3. Check if it worked
-if [ -f "libramulator_wrapper.so" ]; then
-    echo "🎉 SUCCESS! Library built."
-else
-    echo "❌ Build failed."
-fi
-
-
-
+echo "=== 4. BUILDING WRAPPER ==="
+# Now we link using the EXACT path we just found
 g++ -shared -fPIC -o libramulator_wrapper.so \
     src/wrapper.cpp \
     -I ramulator2/src \
-    -L ramulator2/build \
-    -L ramulator2/build/src \
-    -lramulator \
-    -Wl,-rpath,$(pwd)/ramulator2/build/src \
-    -Wl,-rpath,$(pwd)/ramulator2/build \
+    "$LIB_PATH" \
+    -I "$CONDA_PREFIX/include" \
+    -Wl,-rpath,"$LIB_DIR" \
     -O3
 
-
-g++ -shared -fPIC -o libramulator_wrapper.so \
-    src/wrapper.cpp \
-    -I ramulator2/src \
-    -L ramulator2/build \
-    -L ramulator2/build/src \
-    -lramulator2 \
-    -Wl,-rpath,$(pwd)/ramulator2/build/src \
-    -Wl,-rpath,$(pwd)/ramulator2/build \
-    -O3
-
+echo "🎉 SUCCESS! Created: $(pwd)/libramulator_wrapper.so"
