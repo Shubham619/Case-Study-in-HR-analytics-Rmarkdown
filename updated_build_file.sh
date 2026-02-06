@@ -1,30 +1,26 @@
 #!/bin/bash
 set -e
 
-echo "=== BUILD: RAMULATOR2 + WRAPPER (NO RE-CLONE IF EXISTS) ==="
+echo "=== BUILD: RAMULATOR2 + WRAPPER (ROBUST) ==="
 
-# ---------- 1) Check environment ----------
+# 1) Check environment
 if [ -z "$CONDA_PREFIX" ]; then
   echo "[Error] Please run: conda activate base"
   exit 1
 fi
 
-# ---------- 2) Get / update ramulator2 repo ----------
+# 2) Clone if missing
 if [ ! -d "ramulator2/.git" ]; then
-  echo "[Setup] ramulator2 not found. Cloning..."
+  echo "[Setup] Cloning ramulator2..."
   git clone https://github.com/CMU-SAFARI/ramulator2.git
 else
-  echo "[Setup] ramulator2 already exists. Skipping clone."
+  echo "[Setup] ramulator2 exists. Skipping clone."
 fi
 
 cd ramulator2
-
-# Ensure submodules are present (safe to run repeatedly)
-echo "[Setup] Updating submodules..."
 git submodule update --init --recursive
 
-# ---------- 3) Configure + build ramulator2 normally ----------
-echo "[Build] Building Ramulator2..."
+# 3) Configure + build
 mkdir -p build
 cd build
 
@@ -35,42 +31,43 @@ cmake .. \
   -DCMAKE_INCLUDE_PATH="$CONDA_PREFIX/include" \
   -DCMAKE_LIBRARY_PATH="$CONDA_PREFIX/lib"
 
-make -j"$(nproc)"
+# Build everything first
+cmake --build . -j"$(nproc)"
 
-# ---------- 4) Locate Ramulator library ----------
-# Ramulator2 commonly builds: libramulator.so (NOT libramulator2.so)
-echo "[Build] Locating built Ramulator library..."
-LIB_PATH=""
+# 4) Try to find libramulator.* (shared/static)
+find_libramulator() {
+  find . -maxdepth 8 -type f \( \
+    -name "libramulator.so" -o -name "libramulator.a" -o -name "libramulator.dylib" \
+  \) 2>/dev/null | head -n 1
+}
 
-# Linux: .so or static .a
-for f in $(find . -maxdepth 8 -type f \( -name "libramulator.so" -o -name "libramulator.a" \) 2>/dev/null); do
-  LIB_PATH="$(realpath "$f")"
-  break
-done
+LIB_CANDIDATE="$(find_libramulator || true)"
 
-# macOS fallback: .dylib
-if [ -z "$LIB_PATH" ]; then
-  for f in $(find . -maxdepth 8 -type f -name "libramulator.dylib" 2>/dev/null); do
-    LIB_PATH="$(realpath "$f")"
-    break
-  done
+# If not found, try building common library target explicitly
+if [ -z "$LIB_CANDIDATE" ]; then
+  echo "[Info] libramulator.* not found yet. Trying to build library target 'ramulator'..."
+  if cmake --build . --target help | grep -qi "ramulator"; then
+    cmake --build . --target ramulator -j"$(nproc)" || true
+  fi
+  LIB_CANDIDATE="$(find_libramulator || true)"
 fi
 
-if [ -z "$LIB_PATH" ]; then
+if [ -z "$LIB_CANDIDATE" ]; then
   echo "[Error] Could not find libramulator.(so|a|dylib) under ramulator2/build."
-  echo "Try running manually:"
-  echo "  find . -type f | grep -i libramulator"
+  echo "Debug commands:"
+  echo "  find . -maxdepth 10 -type f | grep -i ramulator"
+  echo "  cmake --build . --target help | grep -i ramulator"
   exit 1
 fi
 
-echo "[OK] Found: $LIB_PATH"
+LIB_PATH="$(realpath "$LIB_CANDIDATE")"
+echo "[OK] Found Ramulator library: $LIB_PATH"
 
-# Go back to project root (where your src/wrapper.cpp is)
 cd ../..
 
-# ---------- 5) Compile your wrapper ----------
-echo "[Build] Compiling wrapper -> build/libramulator_wrapper.so"
+# 5) Compile wrapper
 mkdir -p build
+echo "[Build] Compiling wrapper -> build/libramulator_wrapper.so"
 
 g++ -std=c++20 -shared -fPIC -O3 \
   -o build/libramulator_wrapper.so \
@@ -82,5 +79,5 @@ g++ -std=c++20 -shared -fPIC -O3 \
   -Wl,-rpath,"$(dirname "$LIB_PATH")"
 
 echo "=== SUCCESS ==="
-echo "Wrapper: $(pwd)/build/libramulator_wrapper.so"
+echo "Wrapper:  $(pwd)/build/libramulator_wrapper.so"
 echo "Ramulator: $LIB_PATH"
