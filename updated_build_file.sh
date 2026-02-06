@@ -1,14 +1,15 @@
 #!/bin/bash
-set -e # Exit immediately on error
+set -e
 
-echo "=== LINUX BUILD STARTED ==="
+echo "=== FIXED LINUX BUILD STARTED ==="
 
-# 1. Install Dependencies (Debian/Ubuntu)
-if [ -x "$(command -v apt)" ]; then
-    echo "[Setup] Installing dependencies via apt..."
-    sudo apt update
-    sudo apt install -y build-essential cmake libyaml-cpp-dev libspdlog-dev git
+# 1. Check for Conda
+if [ -z "$CONDA_PREFIX" ]; then
+    echo "[Error] You are not inside a Conda environment."
+    echo "Please run 'conda activate base' first."
+    exit 1
 fi
+echo "[Setup] Using Conda environment at: $CONDA_PREFIX"
 
 # 2. Prepare Ramulator Directory
 if [ ! -d "ramulator2" ]; then
@@ -21,7 +22,7 @@ else
     echo "[Setup] Ramulator2 directory found."
 fi
 
-# 3. Inject Helper Function (Idempotent: checks if already injected)
+# 3. Inject Helper Function (Idempotent)
 if grep -q "ramulator_create_system" ramulator2/src/memory_system/memory_system.cpp; then
     echo "[Patch] Helper function already injected."
 else
@@ -56,23 +57,59 @@ extern "C" {
 EOF
 fi
 
-# 4. Build Ramulator Library
+# 4. FORCE LIBRARY CREATION (The Fix)
+# We need to tell CMake to build a shared library, not just an executable.
+if grep -q "add_library(ramulator2 SHARED" ramulator2/src/CMakeLists.txt; then
+    echo "[Patch] CMakeLists already patched."
+else
+    echo "[Patch] Modifying CMakeLists.txt to force shared library creation..."
+    # We append a rule to build all source files into a shared library named 'ramulator2'
+    cat <<EOF >> ramulator2/src/CMakeLists.txt
+
+# --- PATCH FOR PYTHON WRAPPER ---
+file(GLOB_RECURSE ALL_SOURCES "*.cpp")
+# Filter out main.cpp so it doesn't conflict
+list(FILTER ALL_SOURCES EXCLUDE REGEX "main.cpp")
+add_library(ramulator2 SHARED \${ALL_SOURCES})
+target_link_libraries(ramulator2 PUBLIC yaml-cpp spdlog::spdlog)
+target_include_directories(ramulator2 PUBLIC \${CMAKE_CURRENT_SOURCE_DIR})
+EOF
+fi
+
+# 5. Build Ramulator Library
 echo "[Build] Building Ramulator2 Core..."
 mkdir -p ramulator2/build
 cd ramulator2/build
-# Linux requires standard cmake flags
-cmake .. -DCMAKE_POSITION_INDEPENDENT_CODE=ON -DCMAKE_BUILD_TYPE=Release
+
+cmake .. \
+    -DCMAKE_POSITION_INDEPENDENT_CODE=ON \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH="$CONDA_PREFIX" \
+    -DCMAKE_INCLUDE_PATH="$CONDA_PREFIX/include" \
+    -DCMAKE_LIBRARY_PATH="$CONDA_PREFIX/lib"
+
 make -j$(nproc)
 cd ../..
 
-# 5. Compile Wrapper
+# 6. Verify Library Exists
+LIB_FILE="ramulator2/build/src/libramulator2.so"
+if [ ! -f "$LIB_FILE" ]; then
+    echo "[Error] Library file not found at $LIB_FILE"
+    echo "Build failed to generate the .so file."
+    exit 1
+fi
+echo "[Build] Library found at: $LIB_FILE"
+
+# 7. Compile Wrapper
 echo "[Build] Compiling Wrapper and Linking..."
 mkdir -p build
+
 g++ -shared -fPIC -o build/libramulator_wrapper.so \
     src/wrapper.cpp \
     -I ramulator2/src \
-    -L ramulator2/build -lramulator2 \
-    -Wl,-rpath,$(pwd)/ramulator2/build \
+    "$LIB_FILE" \
+    -I "$CONDA_PREFIX/include" \
+    -Wl,-rpath,$(pwd)/ramulator2/build/src \
     -O3
 
 echo "=== BUILD SUCCESSFUL ==="
