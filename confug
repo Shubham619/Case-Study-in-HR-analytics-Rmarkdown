@@ -19,3 +19,31 @@ MemorySystem:
     RefreshManager:
       impl: AllBank
 EOF
+
+# 1. Find the specific name of the Conda compiler (it won't be called just 'g++')
+COMPILER=$(find $CONDA_PREFIX/bin -name "*-g++" | head -n 1)
+
+if [ -z "$COMPILER" ]; then
+    echo "❌ Compiler not found in Conda!"
+    echo "Please run: conda install -y -c conda-forge gxx_linux-64"
+    exit 1
+fi
+
+echo "✅ Using compiler: $COMPILER"
+
+# 2. Run the build using that specific compiler
+"$COMPILER" -shared -fPIC -o libramulator_wrapper.so \
+    src/wrapper.cpp \
+    -I ramulator2/src \
+    -L ramulator2/build \
+    -L ramulator2/build/src \
+    -lramulator2 \
+    -Wl,-rpath,$(pwd)/ramulator2/build/src \
+    -O3
+
+# 3. Check if it worked
+if [ -f "libramulator_wrapper.so" ]; then
+    echo "🎉 SUCCESS! Library built."
+else
+    echo "❌ Build failed."
+fi
