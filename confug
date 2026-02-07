@@ -476,3 +476,50 @@ ldd ./ramulator2/libramulator.so | grep -E "libstdc\+\+|libgcc|yaml|spdlog"
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+SPD=$(find ramulator2 -type d -path "*spdlog*include*" | head -n 1)
+YML=$(find ramulator2 -type d -path "*yaml*include*"   | head -n 1)
+
+g++ -std=c++20 -O3 -o ramulator_driver \
+  interactive_driver.cpp \
+  -I ramulator2/src -I "$SPD" -I "$YML" \
+  -L "$(pwd)/ramulator2" -lramulator \
+  -Wl,-rpath,"$(pwd)/ramulator2"
+
+
