@@ -1,58 +1,121 @@
-#include "base/base.h"
-#include "base/request.h"
-#include "base/config.h"
-#include "frontend/frontend.h"
-#include "memory_system/memory_system.h"
 #include <iostream>
 #include <string>
+#include <sstream>
+#include <atomic>
+#include <cstdint>
+#include <vector>
+#include <functional>
+
+#include "base/config.h"
+#include "base/factory.h"
+#include "base/request.h"
+#include "frontend/frontend.h"
+#include "memory_system/memory_system.h"
 
 using namespace Ramulator;
 
-int main(int argc, char** argv) {
-    if (argc < 2) {
-        std::cout << "ERROR: No config file provided" << std::endl;
-        return 1;
+int main(int argc, char* argv[]) {
+  if (argc < 2) {
+    std::cerr << "Usage: " << argv[0] << " <config.yaml>\n";
+    return 1;
+  }
+
+  // 1) Parse config using Ramulator2 parser (Critical for defaults/inheritance)
+  YAML::Node config;
+  try {
+      config = Config::parse_config_file(std::string(argv[1]), {});
+  } catch (const std::exception& e) {
+      std::cerr << "ERROR: Config parsing failed: " << e.what() << "\n";
+      return 1;
+  }
+
+  // 2) Create and connect frontend + memory system
+  auto* frontend = Factory::create_frontend(config);
+  auto* memsys   = Factory::create_memory_system(config);
+
+  if (!frontend || !memsys) {
+    std::cerr << "ERROR: Failed to create frontend or memory system.\n";
+    return 2;
+  }
+
+  // Connect them (Official flow)
+  frontend->connect_memory_system(memsys);
+  memsys->connect_frontend(frontend);
+
+  std::cout << "READY" << std::endl;
+
+  // Protocol:
+  //   TICK <n>
+  //   REQ <addr_hex> <is_write 0/1> <ctx_id> <block 0/1> <timeout_cycles>
+  //   EXIT
+  std::string cmd;
+  while (std::cin >> cmd) {
+    if (cmd == "EXIT") break;
+
+    if (cmd == "TICK") {
+      uint64_t n = 1;
+      std::cin >> n;
+      for (uint64_t i = 0; i < n; i++) {
+        frontend->tick();
+        memsys->tick();
+      }
+      std::cout << "OK" << std::endl;
+      continue;
     }
 
-    // 1. Load Config
-    std::string config_file = argv[1];
-    YAML::Node config = YAML::LoadFile(config_file);
+    if (cmd == "REQ") {
+      std::string addr_s;
+      int is_write = 0;
+      int ctx = 0;
+      int block = 1;
+      uint64_t timeout = 1000000;
 
-    // 2. Create Memory System
-    auto* memory_system = Factory<IMemorySystem>::create(
-        config["MemorySystem"]["impl"].as<std::string>(), 
-        config["MemorySystem"], 
-        nullptr
-    );
+      std::cin >> addr_s >> is_write >> ctx >> block >> timeout;
 
-    // 3. Signal Ready
-    std::cout << "READY" << std::endl;
+      uint64_t addr = std::stoull(addr_s, nullptr, 16);
+      std::atomic<bool> done{false};
 
-    // 4. Command Loop (Listens to Python)
-    std::string command;
-    long addr;
-    int type_int;
+      // Ramulator2 Request: Type, Address, ID
+      Request req(addr, is_write ? Request::Type::Write : Request::Type::Read);
+      
+      // Send request to Frontend
+      bool accepted = frontend->receive_external_requests(0, addr, ctx, 
+        [&](Request& r) { done.store(true, std::memory_order_release); }
+      );
 
-    while (std::cin >> command) {
-        if (command == "EXIT") {
-            break;
-        } 
-        else if (command == "TICK") {
-            memory_system->tick();
-            std::cout << "OK" << std::endl;
-        } 
-        else if (command == "REQ") {
-            // Format: REQ <addr> <type_int>
-            std::cin >> addr >> type_int;
-            
-            Request req(addr, (Request::Type)type_int);
-            bool accepted = memory_system->send(req);
-            
-            std::cout << (accepted ? "ACCEPTED" : "STALLED") << std::endl;
-        }
+      if (!accepted) {
+        std::cout << "STALLED" << std::endl;
+        continue;
+      }
+
+      if (!block) {
+        std::cout << "ACCEPTED" << std::endl;
+        continue;
+      }
+
+      // Blocking completion
+      uint64_t waited = 0;
+      while (!done.load(std::memory_order_acquire) && waited < timeout) {
+        frontend->tick();
+        memsys->tick();
+        waited++;
+      }
+
+      if (!done.load(std::memory_order_acquire)) {
+        std::cout << "TIMEOUT" << std::endl;
+      } else {
+        std::cout << "DONE " << waited << std::endl;
+      }
+      continue;
     }
 
-    // Cleanup
-    memory_system->finalize();
-    return 0;
+    std::cout << "ERR unknown_command" << std::endl;
+  }
+
+  // Cleanup
+  frontend->finalize();
+  memsys->finalize();
+  // delete frontend; // Optional, OS will clean up
+  // delete memsys;
+  return 0;
 }
