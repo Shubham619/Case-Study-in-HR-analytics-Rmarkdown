@@ -252,3 +252,53 @@ g++ -std=c++20 -O2 interactive_main.cpp \
   mapping:
     impl: RoBaRaCoCh # Row-Bank-Rank-Col-Channel
     # You can customize these bit positions based on your needs
+
+
+
+
+
+
+
+
+
+
+# ddr5_config.yaml
+
+Frontend:
+  impl: ReadWriteTrace
+  # Put any simple RW trace here (or keep the example_inst.trace style if you use that frontend)
+  path: ./example_inst.trace
+  clock_ratio: 3
+
+Translation:
+  impl: RandomTranslation
+  # must be >= max address in your trace; this big value is commonly used
+  max_addr: 1140736775975936
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 3
+
+  DRAM:
+    impl: DDR5
+    org:
+      preset: DDR5_16Gb_x8
+      channel: 1
+      rank: 2
+    timing:
+      preset: DDR5_3200AN
+
+  Controller:
+    impl: Generic
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: AllBank
+    RowPolicy:
+      impl: ClosedRowPolicy
+      cap: 4
+    plugins: []
+
+  AddrMapper:
+    impl: RoBaRaCoCh
+
