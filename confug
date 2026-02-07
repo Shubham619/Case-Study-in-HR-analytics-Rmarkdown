@@ -176,3 +176,58 @@ class RamulatorEnv:
             self.proc.terminate()
 
 
+
+
+Frontend:
+  impl: SimpleFrontend
+  scheduler:
+    impl: FRFCFS
+  mem_size_limit_mb: 0 # 0 means use full capacity
+
+MemorySystem:
+  impl: DDR5
+  clock: 2400 # 2400 MHz = DDR5-4800 MT/s
+  organization:
+    impl: DDR5
+    density: 16Gb
+    DQ: 8
+    DGL: 4
+  controller:
+    impl: Generic
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: AllBank
+    RowPolicy:
+      impl: ClosedRowPolicy # Or 'OpenRowPolicy'
+  timing:
+    impl: DDR5
+    rate: 2400
+    tCK_ps: 416
+    # Timing constraints (in cycles or ns)
+    # These are standard JEDEC DDR5-4800 values
+    tRCD: 40
+    tRP: 40
+    tRAS: 77
+    tRC: 117
+    tWR: 72
+    tRTP: 18
+    tCWL: 38
+    tCCD_L: 12
+    tCCD_S: 8
+    tRRD_L: 12
+    tRRD_S: 8
+    tWTR_L: 24
+    tWTR_S: 8
+    tFAW: 40
+    tRFC1: 410 # 16Gb density
+    tRFC2: 220
+    tRFCsb: 130
+    tREFI: 9360 # 3.9us at >85C, or 7.8us at <85C (18720)
+    # Voltage/Power (Optional, often separate plugin)
+    VDD: 1.1
+
+  # Address Mapping (Critical for performance)
+  mapping:
+    impl: RoBaRaCoCh # Row-Bank-Rank-Col-Channel
+    # You can customize these bit positions based on your needs
