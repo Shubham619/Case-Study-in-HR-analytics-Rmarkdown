@@ -370,3 +370,55 @@ MemorySystem:
   AddrMapper:
     impl: RoBaRaCoCh
 
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================
+# DDR5 INTERACTIVE CONFIG
+# (NO TRACE FILE REQUIRED)
+# ============================
+
+Frontend:
+  impl: External
+  clock_ratio: 1
+
+Translation:
+  impl: RandomTranslation
+  max_addr: 1073741824   # 1 GiB address space (safe for testing)
+
+MemorySystem:
+  impl: GenericDRAM
+  clock_ratio: 1
+
+  DRAM:
+    impl: DDR5
+    org:
+      preset: DDR5_16Gb_x8
+      channel: 1
+      rank: 1
+    timing:
+      preset: DDR5_3200AN
+
+  Controller:
+    impl: Generic
+    Scheduler:
+      impl: FRFCFS
+    RowPolicy:
+      impl: ClosedRowPolicy
+      cap: 4
+    RefreshManager:
+      impl: AllBank
+    plugins: []
+
+  AddrMapper:
+    impl: RoBaRaCoCh
+
