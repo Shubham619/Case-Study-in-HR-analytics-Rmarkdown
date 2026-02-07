@@ -422,3 +422,57 @@ MemorySystem:
   AddrMapper:
     impl: RoBaRaCoCh
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+conda deactivate 2>/dev/null || true
+unset CC CXX CFLAGS CXXFLAGS LDFLAGS CPPFLAGS
+
+cd ramulator2
+rm -rf build
+mkdir build
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_C_COMPILER=/usr/bin/gcc \
+  -DCMAKE_CXX_COMPILER=/usr/bin/g++ \
+  -DCMAKE_CXX_STANDARD=20 \
+  -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+cmake --build build -j"$(nproc)"
+cd ..
+
+
+g++ -std=c++20 -O2 interactive_main.cpp \
+  -I ramulator2/src \
+  -I ramulator2/build/_deps/yaml-cpp-src/include \
+  -I ramulator2/build/_deps/spdlog-src/include \
+  -L ramulator2 -lramulator \
+  -Wl,-rpath,"$PWD/ramulator2" \
+  -o ramulator2_interactive
+
+
+./ramulator2_interactive ramulator2/configs/ddr5_interactive.yaml
+
+
+ldd ./ramulator2_interactive | grep -E "libstdc\+\+|libgcc|yaml|spdlog|ramulator"
+ldd ./ramulator2/libramulator.so | grep -E "libstdc\+\+|libgcc|yaml|spdlog"
+
+
+
