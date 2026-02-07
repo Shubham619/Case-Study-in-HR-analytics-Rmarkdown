@@ -1,11 +1,7 @@
 #include <iostream>
 #include <string>
-#include <sstream>
-#include <atomic>
-#include <cstdint>
 #include <vector>
-#include <functional>
-
+#include <atomic>
 #include "base/config.h"
 #include "base/factory.h"
 #include "base/request.h"
@@ -16,106 +12,167 @@ using namespace Ramulator;
 
 int main(int argc, char* argv[]) {
   if (argc < 2) {
-    std::cerr << "Usage: " << argv[0] << " <config.yaml>\n";
+    std::cerr << "Usage: " << argv[0] << " <config.yaml>" << std::endl;
     return 1;
   }
 
-  // 1) Parse config using Ramulator2 parser (Critical for defaults/inheritance)
+  // 1. Load Config (Official Way)
   YAML::Node config;
   try {
-      config = Config::parse_config_file(std::string(argv[1]), {});
+    config = Config::parse_config_file(std::string(argv[1]), {});
   } catch (const std::exception& e) {
-      std::cerr << "ERROR: Config parsing failed: " << e.what() << "\n";
-      return 1;
+    std::cerr << "ERROR: Config parsing failed: " << e.what() << std::endl;
+    return 1;
   }
 
-  // 2) Create and connect frontend + memory system
+  // 2. Create System
   auto* frontend = Factory::create_frontend(config);
-  auto* memsys   = Factory::create_memory_system(config);
+  auto* memsys = Factory::create_memory_system(config);
 
   if (!frontend || !memsys) {
-    std::cerr << "ERROR: Failed to create frontend or memory system.\n";
-    return 2;
+    std::cerr << "ERROR: Could not create frontend or memory system." << std::endl;
+    return 1;
   }
 
-  // Connect them (Official flow)
   frontend->connect_memory_system(memsys);
   memsys->connect_frontend(frontend);
 
   std::cout << "READY" << std::endl;
 
-  // Protocol:
-  //   TICK <n>
-  //   REQ <addr_hex> <is_write 0/1> <ctx_id> <block 0/1> <timeout_cycles>
-  //   EXIT
+  // 3. Command Loop
   std::string cmd;
   while (std::cin >> cmd) {
     if (cmd == "EXIT") break;
 
     if (cmd == "TICK") {
-      uint64_t n = 1;
-      std::cin >> n;
-      for (uint64_t i = 0; i < n; i++) {
+      int cycles;
+      std::cin >> cycles;
+      for(int i=0; i<cycles; i++) {
         frontend->tick();
         memsys->tick();
       }
       std::cout << "OK" << std::endl;
-      continue;
     }
-
-    if (cmd == "REQ") {
-      std::string addr_s;
-      int is_write = 0;
-      int ctx = 0;
-      int block = 1;
-      uint64_t timeout = 1000000;
-
-      std::cin >> addr_s >> is_write >> ctx >> block >> timeout;
-
-      uint64_t addr = std::stoull(addr_s, nullptr, 16);
-      std::atomic<bool> done{false};
-
-      // Ramulator2 Request: Type, Address, ID
-      Request req(addr, is_write ? Request::Type::Write : Request::Type::Read);
+    else if (cmd == "REQ") {
+      std::string addr_hex;
+      int is_write;
+      std::cin >> addr_hex >> is_write;
       
-      // Send request to Frontend
-      bool accepted = frontend->receive_external_requests(0, addr, ctx, 
-        [&](Request& r) { done.store(true, std::memory_order_release); }
+      uint64_t addr = std::stoull(addr_hex, nullptr, 16);
+      
+      // Send to Frontend (0=Read, 1=Write usually, check if flipped in your specific version)
+      bool accepted = frontend->receive_external_requests(
+          is_write ? 0 : 1, 
+          addr, 
+          0, 
+          [](Request& r){}
       );
 
-      if (!accepted) {
-        std::cout << "STALLED" << std::endl;
-        continue;
-      }
-
-      if (!block) {
-        std::cout << "ACCEPTED" << std::endl;
-        continue;
-      }
-
-      // Blocking completion
-      uint64_t waited = 0;
-      while (!done.load(std::memory_order_acquire) && waited < timeout) {
-        frontend->tick();
-        memsys->tick();
-        waited++;
-      }
-
-      if (!done.load(std::memory_order_acquire)) {
-        std::cout << "TIMEOUT" << std::endl;
-      } else {
-        std::cout << "DONE " << waited << std::endl;
-      }
-      continue;
+      std::cout << (accepted ? "ACCEPTED" : "STALLED") << std::endl;
     }
-
-    std::cout << "ERR unknown_command" << std::endl;
   }
 
-  // Cleanup
   frontend->finalize();
   memsys->finalize();
-  // delete frontend; // Optional, OS will clean up
-  // delete memsys;
   return 0;
 }
+
+
+
+
+
+
+# 1. Find the library you built earlier
+LIB_PATH=$(find ramulator2 -name "libramulator*.so" | head -n 1)
+
+if [ -z "$LIB_PATH" ]; then
+    echo "❌ Error: Could not find libramulator.so. You must build Ramulator first."
+    exit 1
+fi
+
+LIB_DIR=$(dirname "$LIB_PATH")
+# Extract name 'ramulator' or 'ramulator2'
+LIB_NAME=$(basename "$LIB_PATH" | sed 's/lib//' | sed 's/\.so//') 
+
+echo "✅ Found Library: $LIB_NAME in $LIB_DIR"
+
+# 2. Compile the driver
+g++ -o ramulator_driver \
+    interactive_driver.cpp \
+    -I ramulator2/src \
+    -L "$LIB_DIR" \
+    -l"$LIB_NAME" \
+    -lyaml-cpp \
+    -Wl,-rpath,"$LIB_DIR" \
+    -O3
+
+if [ -f "ramulator_driver" ]; then
+    echo "🎉 SUCCESS! Executable created: ./ramulator_driver"
+else
+    echo "❌ Build failed."
+fi
+
+
+
+
+
+
+
+import subprocess
+import os
+
+class RamulatorEnv:
+    def __init__(self, config_path):
+        # Point to the NEW driver
+        exe_path = "./ramulator_driver"
+        
+        if not os.path.exists(exe_path):
+            raise FileNotFoundError(f"Driver not found at {exe_path}")
+
+        # Launch
+        self.proc = subprocess.Popen(
+            [exe_path, config_path],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1
+        )
+
+        # Wait for "READY"
+        line = self.proc.stdout.readline().strip()
+        if line != "READY":
+            raise RuntimeError(f"Simulator failed to start: {line}")
+        print("✅ Ramulator Connected!")
+
+    def step(self, action):
+        # Action mapping: 0=Read, 1=Write, 2=Wait
+        if action == 2:
+            self.proc.stdin.write("TICK 1\n") 
+            self.proc.stdin.flush()
+            self.proc.stdout.readline() # Consume "OK"
+            return 0, False
+
+        else:
+            # REQ <addr_hex> <is_write>
+            addr_hex = "0x123400" 
+            is_write = 1 if action == 1 else 0
+            
+            cmd = f"REQ {addr_hex} {is_write}\n"
+            self.proc.stdin.write(cmd)
+            self.proc.stdin.flush()
+            
+            response = self.proc.stdout.readline().strip()
+            
+            if response == "ACCEPTED":
+                return 1, False
+            elif response == "STALLED":
+                return -0.1, False
+            else:
+                return 0, False
+
+    def close(self):
+        if self.proc:
+            self.proc.stdin.write("EXIT\n")
+            self.proc.terminate()
+
+
