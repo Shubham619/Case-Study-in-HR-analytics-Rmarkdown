@@ -299,6 +299,74 @@ MemorySystem:
       cap: 4
     plugins: []
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+Frontend:
+  impl: SimpleFrontend
+  scheduler:
+    impl: FRFCFS
+  mem_size_limit_mb: 0
+
+MemorySystem:
+  impl: DDR4
+  clock: 2400
+  organization:
+    impl: DDR4
+    density: 8Gb
+    DQ: 8
+    DGL: 4
+  controller:
+    impl: Generic
+    Scheduler:
+      impl: FRFCFS
+    RefreshManager:
+      impl: AllBank
+    RowPolicy:
+      impl: ClosedRowPolicy
+  timing:
+    impl: DDR4
+    rate: 2400
+    tCK_ps: 833
+    tRCD: 14
+    tRP: 14
+    tRAS: 32
+    tRC: 46
+    tWR: 16
+    tRTP: 8
+    tCWL: 11
+    tCCD_L: 6
+    tCCD_S: 4
+    tRRD_L: 6
+    tRRD_S: 4
+    tWTR_L: 8
+    tWTR_S: 3
+    tFAW: 24
+    tRFC: 350
+    tREFI: 7800
+  mapping:
+    impl: RoBaRaCoCh
   AddrMapper:
     impl: RoBaRaCoCh
 
