@@ -404,3 +404,100 @@ g++ -std=c++20 -O3 -o ramulator_driver \
   -Wl,-rpath,"$(pwd)/ramulator2"
 
 
+
+
+
+
+
+
+
+#include <iostream>
+#include <string>
+#include <cstdint>
+
+#include "base/config.h"
+#include "base/request.h"
+#include "frontend/frontend.h"
+#include "memory_system/memory_system.h"
+
+using namespace Ramulator;
+
+static void die_usage(const char* argv0) {
+  std::cerr << "Usage: " << argv0 << " <config_yaml>\n"
+            << "Then interact on stdin:\n"
+            << "  REQWAIT <hex_or_dec_addr> <is_write 0/1> <ctx>\n"
+            << "  EXIT\n";
+  std::exit(1);
+}
+
+int main(int argc, char** argv) {
+  if (argc < 2) die_usage(argv[0]);
+  const std::string cfg_path = argv[1];
+
+  // 1) Parse config + create top-level components (official API)
+  YAML::Node config = Ramulator::Config::parse_config_file(cfg_path, {});
+  IFrontEnd* fe = Ramulator::Factory::create_frontend(config);
+  IMemorySystem* ms = Ramulator::Factory::create_memory_system(config);
+
+  if (!fe || !ms) {
+    std::cerr << "ERROR: Failed to create frontend or memory system. Check YAML.\n";
+    return 2;
+  }
+
+  // 2) Wire them up (official docs)
+  fe->connect_memory_system(ms);
+  ms->connect_frontend(fe);
+
+  // 3) Ready signal
+  std::cout << "READY\n" << std::flush;
+
+  uint64_t cycles = 0;
+
+  std::string cmd;
+  while (std::cin >> cmd) {
+    if (cmd == "EXIT") break;
+
+    if (cmd == "REQWAIT") {
+      uint64_t addr = 0;
+      int is_write = 0;
+      int ctx = 0;
+      std::cin >> std::hex >> addr >> std::dec >> is_write >> ctx;
+
+      bool done = false;
+      uint64_t issue = cycles;
+      uint64_t done_cycle = 0;
+
+      auto cb = [&](Ramulator::Request& /*req*/) {
+        done = true;
+        done_cycle = cycles;
+      };
+
+      // Send through the Frontend external injection API (official docs)
+      bool accepted = fe->receive_external_requests(
+        /*tick*/ 0, /*addr*/ addr, /*context_id*/ ctx, cb
+      );
+
+      if (!accepted) {
+        std::cout << "STALLED\n" << std::flush;
+        continue;
+      }
+
+      // Tick until callback fires
+      while (!done) {
+        fe->tick();
+        ms->tick();
+        cycles++;
+      }
+
+      uint64_t latency = (done_cycle >= issue) ? (done_cycle - issue) : 0;
+      std::cout << "OK " << latency << "\n" << std::flush;
+      continue;
+    }
+
+    std::cout << "ERR unknown_command\n" << std::flush;
+  }
+
+  fe->finalize();
+  ms->finalize();
+  return 0;
+}
