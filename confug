@@ -851,3 +851,105 @@ ls -l ramulator2/build/ramulator_interactive
 
 # Run training
 python3 main.py
+
+
+
+
+
+
+
+
+
+
+#!/bin/bash
+set -e  # Stop immediately if any command fails
+
+echo "=== 1. CREATING DRIVER SOURCE CODE ==="
+# We create the C++ file right here to ensure it exists
+cat <<EOF > ramulator2/src/ramulator_interactive.cpp
+#include <iostream>
+#include <string>
+#include <vector>
+#include "base/config.h"
+#include "base/factory.h"
+#include "base/request.h"
+#include "frontend/frontend.h"
+#include "memory_system/memory_system.h"
+
+using namespace Ramulator;
+
+int main(int argc, char* argv[]) {
+  if (argc < 2) {
+    std::cerr << "Usage: " << argv[0] << " <config.yaml>" << std::endl;
+    return 1;
+  }
+
+  YAML::Node config = Config::parse_config_file(std::string(argv[1]), {});
+  auto* frontend = Factory::create_frontend(config);
+  auto* memsys = Factory::create_memory_system(config);
+
+  frontend->connect_memory_system(memsys);
+  memsys->connect_frontend(frontend);
+
+  std::cout << "READY" << std::endl;
+
+  std::string cmd;
+  while (std::cin >> cmd) {
+    if (cmd == "EXIT") break;
+    if (cmd == "TICK") {
+      int cycles; std::cin >> cycles;
+      for(int i=0; i<cycles; i++) {
+        frontend->tick();
+        memsys->tick();
+      }
+      std::cout << "OK" << std::endl;
+    }
+    else if (cmd == "REQ") {
+      std::string addr_hex; int is_write;
+      std::cin >> addr_hex >> is_write;
+      uint64_t addr = std::stoull(addr_hex, nullptr, 16);
+      bool accepted = frontend->receive_external_requests(
+          is_write ? 0 : 1, addr, 0, [](Request& r){}
+      );
+      std::cout << (accepted ? "ACCEPTED" : "STALLED") << std::endl;
+    }
+  }
+  
+  frontend->finalize();
+  memsys->finalize();
+  return 0;
+}
+EOF
+echo "✅ Created ramulator2/src/ramulator_interactive.cpp"
+
+echo "=== 2. PATCHING CMAKE TO RECOGNIZE IT ==="
+# Check if we already patched it to avoid duplicates
+if grep -q "ramulator_interactive" ramulator2/src/CMakeLists.txt; then
+    echo "⚠️  CMakeLists.txt already patched. Skipping."
+else
+    echo "Writing build instructions to ramulator2/src/CMakeLists.txt..."
+    cat <<EOF >> ramulator2/src/CMakeLists.txt
+
+# --- ADDED BY REBUILD SCRIPT ---
+add_executable(ramulator_interactive ramulator_interactive.cpp)
+target_link_libraries(ramulator_interactive PRIVATE ramulator_lib yaml-cpp spdlog::spdlog)
+target_include_directories(ramulator_interactive PRIVATE src)
+EOF
+fi
+
+echo "=== 3. COMPILING ==="
+cd ramulator2/build
+
+# Force cmake to refresh
+cmake .. -DCMAKE_POSITION_INDEPENDENT_CODE=ON
+
+# Build ONLY our new target (faster)
+make -j$(nproc) ramulator_interactive
+
+echo "=== 4. VERIFICATION ==="
+if [ -f "ramulator_interactive" ]; then
+    echo "🎉 SUCCESS! File created at: $(pwd)/ramulator_interactive"
+else
+    echo "❌ FATAL: Build failed. Check errors above."
+    exit 1
+fi
