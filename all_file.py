@@ -231,3 +231,147 @@ print("✅ Graph saved to gsat_comparison.png")
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+#include "base/request.h"
+#include "base/config.h"
+#include "base/factory.h"
+#include "frontend/frontend.h"
+#include "memory_system/memory_system.h"
+
+#include <iostream>
+#include <sstream>
+#include <string>
+#include <atomic>
+#include <cstdint>
+
+using namespace Ramulator;
+
+static inline void tick_once(IFrontEnd* fe, IMemorySystem* ms) {
+  fe->tick();
+  ms->tick();
+}
+
+int main(int argc, char** argv) {
+  if (argc < 2) {
+    std::cerr << "Usage: " << argv[0] << " <config.yaml>\n";
+    return 1;
+  }
+
+  // Official library flow
+  YAML::Node config = Ramulator::Config::parse_config_file(std::string(argv[1]), {});
+  IFrontEnd* fe = Ramulator::Factory::create_frontend(config);
+  IMemorySystem* ms = Ramulator::Factory::create_memory_system(config);
+
+  if (!fe || !ms) {
+    std::cerr << "ERROR: failed to create frontend/memory system\n";
+    return 2;
+  }
+
+  fe->connect_memory_system(ms);
+  ms->connect_frontend(fe);
+
+  std::cout << "READY" << std::endl;
+
+  // Protocol:
+  // REQ <R|W> <hex_addr> <ctx_id> <max_cycles>
+  // Returns: STALLED | DONE <cycles> | TIMEOUT <cycles> | ERR <reason>
+  // TICK <cycles> -> OK
+  // EXIT -> exits
+  std::string line;
+  while (std::getline(std::cin, line)) {
+    if (line.empty()) continue;
+    std::istringstream iss(line);
+    std::string cmd;
+    iss >> cmd;
+
+    if (cmd == "EXIT") break;
+
+    if (cmd == "TICK") {
+      uint64_t n = 0;
+      iss >> n;
+      if (!iss) { std::cout << "ERR bad_format\n"; continue; }
+      for (uint64_t i = 0; i < n; i++) tick_once(fe, ms);
+      std::cout << "OK" << std::endl;
+      continue;
+    }
+
+    if (cmd == "REQ") {
+      char rw;
+      std::string addr_s;
+      int ctx;
+      uint64_t max_cycles;
+      iss >> rw >> addr_s >> ctx >> max_cycles;
+      if (!iss) { std::cout << "ERR bad_format\n"; continue; }
+
+      uint64_t addr = 0;
+      try { addr = std::stoull(addr_s, nullptr, 16); }
+      catch (...) { std::cout << "ERR bad_addr\n"; continue; }
+
+      int is_write = (rw == 'W' || rw == 'w') ? 1 : 0;
+      std::atomic<bool> done{false};
+
+      bool accepted = fe->receive_external_requests(
+        is_write, addr, ctx,
+        [&](Ramulator::Request& req){ (void)req; done.store(true, std::memory_order_release); }
+      );
+
+      if (!accepted) {
+        std::cout << "STALLED" << std::endl;
+        continue;
+      }
+
+      uint64_t waited = 0;
+      while (!done.load(std::memory_order_acquire) && waited < max_cycles) {
+        tick_once(fe, ms);
+        waited++;
+      }
+
+      if (!done.load(std::memory_order_acquire)) std::cout << "TIMEOUT " << waited << std::endl;
+      else std::cout << "DONE " << waited << std::endl;
+
+      continue;
+    }
+
+    std::cout << "ERR unknown_cmd\n";
+  }
+
+  fe->finalize();
+  ms->finalize();
+  return 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+SPD=$(find ramulator2 -type d -path "*spdlog*include*" | head -n 1)
+YML=$(find ramulator2 -type d -path "*yaml*include*"   | head -n 1)
+
+g++ -std=c++20 -O3 -o ramulator_driver \
+  interactive_driver.cpp \
+  -I ramulator2/src -I "$SPD" -I "$YML" \
+  -L "$(pwd)/ramulator2" -lramulator \
+  -Wl,-rpath,"$(pwd)/ramulator2"
+
+
