@@ -372,6 +372,35 @@ g++ -std=c++20 -O3 -o ramulator_driver \
   interactive_driver.cpp \
   -I ramulator2/src -I "$SPD" -I "$YML" \
   -L "$(pwd)/ramulator2" -lramulator \
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+YAML_H=$(find ramulator2 -type f -path "*yaml-cpp*/yaml.h" | head -n 1)
+YAML_INC=$(dirname "$(dirname "$YAML_H")")   # goes up from .../yaml-cpp/yaml.h to .../include
+
+SPD_H=$(find ramulator2 -type f -path "*spdlog*/spdlog.h" | head -n 1)
+SPD_INC=$(dirname "$(dirname "$SPD_H")")
+
+echo "YAML_INC=$YAML_INC"
+echo "SPD_INC=$SPD_INC"
+
+g++ -std=c++20 -O3 -o ramulator_driver \
+  interactive_driver.cpp \
+  -I ramulator2/src -I "$YAML_INC" -I "$SPD_INC" \
+  -L "$(pwd)/ramulator2" -lramulator \
+  -Wl,-rpath,"$(pwd)/ramulator2"
+
   -Wl,-rpath,"$(pwd)/ramulator2"
 
 
