@@ -1,6 +1,958 @@
 #!/usr/bin/env python3
 # gsat_rl_allinone.py
 #
+# One-file end-to-end: training and evaluation of stress patterns on a
+# memory system.  The module includes a complete, hard-coded catalog of
+# the patterns defined in the original Google "pattern.cc" (64- and
+# 32-bit walking patterns, checkerboards, etc.), fully expanded into
+# 32/64/128/256-bit variants and their inverted forms.  It supports an
+# interactive driver (via subprocess) to send read/write requests to
+# Ramulator2 and provides baseline exhaustive testing and a simple
+# ε-greedy bandit learner.  Metrics such as time-to-first fault (TTFF),
+# events per minute and latency distribution are reported at the end
+# of a run.  Only standard library modules are used and no external
+# dependencies are required.
+
+import argparse
+import json
+import random
+import subprocess
+import time
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict, Any
+
+MASK32 = 0xFFFFFFFF
+
+
+###############################################################################
+# A) Complete pattern.cc hardcoded catalog
+###############################################################################
+
+@dataclass(frozen=True)
+class PatternFamily:
+    """Represents a family of patterns.
+
+    Each pattern family carries a list of 32-bit words (`data_u32`) and a set
+    of weights for different bus widths.  The original C++ code defines the
+    pattern length to be the number of entries minus one (the last element is
+    considered a sentinel value that is not part of the repeating sequence).
+    """
+
+    name: str
+    data_u32: List[int]                # includes last sentinel (C++ uses len-1)
+    weights: Tuple[int, int, int, int] # w32, w64, w128, w256
+
+    @property
+    def count(self) -> int:
+        """Return the effective length of the pattern (excluding sentinel)."""
+        return max(0, len(self.data_u32) - 1)
+
+
+@dataclass(frozen=True)
+class PatternVariant:
+    """Represents a specific variant (family × width × inversion)."""
+
+    family: PatternFamily
+    buswidth: int
+    invert: bool
+    weight: int
+    busshift: int
+
+    @property
+    def label(self) -> str:
+        """Return a human-readable label for the variant."""
+        return f"{self.family.name}{'~' if self.invert else ''}{self.buswidth}"
+
+    def word(self, i: int) -> int:
+        """Compute the i-th 32-bit word in the sequence for this variant.
+
+        The pattern repeats over `family.count` entries but advances more
+        slowly as the bus width increases (controlled by `busshift`).  If
+        `invert` is true, the bits are flipped.
+        """
+        cnt = self.family.count
+        if cnt <= 0:
+            base = 0
+        else:
+            idx = ((i >> self.busshift) % cnt)
+            base = self.family.data_u32[idx] & MASK32
+        if self.invert:
+            base ^= MASK32
+        return base & MASK32
+
+
+def _busshift(buswidth: int) -> int:
+    """Return shift amount (0..3) corresponding to buswidth."""
+    if buswidth == 32:
+        return 0
+    if buswidth == 64:
+        return 1
+    if buswidth == 128:
+        return 2
+    if buswidth == 256:
+        return 3
+    raise ValueError(f"Unsupported buswidth: {buswidth}")
+
+
+# The following arrays are the exact 32-bit patterns from pattern.cc.  The
+# sentinel value at the end of each array is included to preserve parity
+# with the original C++ code; it is not used in the repeating sequence.
+
+walkingOnes_data = [
+    0x00000001, 0x00000002, 0x00000004, 0x00000008,
+    0x00000010, 0x00000020, 0x00000040, 0x00000080,
+    0x00000100, 0x00000200, 0x00000400, 0x00000800,
+    0x00001000, 0x00002000, 0x00004000, 0x00008000,
+    0x00010000, 0x00020000, 0x00040000, 0x00080000,
+    0x00100000, 0x00200000, 0x00400000, 0x00800000,
+    0x01000000, 0x02000000, 0x04000000, 0x08000000,
+    0x10000000, 0x20000000, 0x40000000, 0x80000000,
+    0x40000000, 0x20000000, 0x10000000, 0x08000000,
+    0x04000000, 0x02000000, 0x01000000, 0x00800000,
+    0x00400000, 0x00200000, 0x00100000, 0x00080000,
+    0x00040000, 0x00020000, 0x00010000, 0x00008000,
+    0x00004000, 0x00002000, 0x00001000, 0x00000800,
+    0x00000400, 0x00000200, 0x00000100, 0x00000080,
+    0x00000040, 0x00000020, 0x00000010, 0x00000008,
+    0x00000004, 0x00000002, 0x00000001, 0x00000000,
+]
+
+walkingInvOnes_data = [
+    0x00000001, 0xfffffffe, 0x00000002, 0xfffffffd,
+    0x00000004, 0xfffffffb, 0x00000008, 0xfffffff7,
+    0x00000010, 0xffffffef, 0x00000020, 0xffffffdf,
+    0x00000040, 0xffffffbf, 0x00000080, 0xffffff7f,
+    0x00000100, 0xfffffeff, 0x00000200, 0xfffffdff,
+    0x00000400, 0xfffffbff, 0x00000800, 0xfffff7ff,
+    0x00001000, 0xffffefff, 0x00002000, 0xffffdfff,
+    0x00004000, 0xffffbfff, 0x00008000, 0xffff7fff,
+    0x00010000, 0xfffeffff, 0x00020000, 0xfffdffff,
+    0x00040000, 0xfffbffff, 0x00080000, 0xfff7ffff,
+    0x00100000, 0xffefffff, 0x00200000, 0xffdfffff,
+    0x00400000, 0xffbfffff, 0x00800000, 0xff7fffff,
+    0x01000000, 0xfeffffff, 0x02000000, 0xfdffffff,
+    0x04000000, 0xfbffffff, 0x08000000, 0xf7ffffff,
+    0x10000000, 0xefffffff, 0x20000000, 0xdfffffff,
+    0x40000000, 0xbfffffff, 0x80000000, 0x7fffffff,
+    0x40000000, 0xbfffffff, 0x20000000, 0xdfffffff,
+    0x10000000, 0xefffffff, 0x08000000, 0xf7ffffff,
+    0x04000000, 0xfbffffff, 0x02000000, 0xfdffffff,
+    0x01000000, 0xfeffffff, 0x00800000, 0xff7fffff,
+    0x00400000, 0xffbfffff, 0x00200000, 0xffdfffff,
+    0x00100000, 0xffefffff, 0x00080000, 0xfff7ffff,
+    0x00040000, 0xfffbffff, 0x00020000, 0xfffdffff,
+    0x00010000, 0xfffeffff, 0x00008000, 0xffff7fff,
+    0x00004000, 0xffffbfff, 0x00002000, 0xffffdfff,
+    0x00001000, 0xffffefff, 0x00000800, 0xfffff7ff,
+    0x00000400, 0xfffffbff, 0x00000200, 0xfffffdff,
+    0x00000100, 0xfffffeff, 0x00000080, 0xffffff7f,
+    0x00000040, 0xffffffbf, 0x00000020, 0xffffffdf,
+    0x00000010, 0xffffffef, 0x00000008, 0xfffffff7,
+    0x00000004, 0xfffffffb, 0x00000002, 0xfffffffd,
+    0x00000001, 0xfffffffe, 0x00000000, 0xffffffff,
+]
+
+walkingZeros_data = [
+    0xfffffffe, 0xfffffffd, 0xfffffffb, 0xfffffff7,
+    0xffffffef, 0xffffffdf, 0xffffffbf, 0xffffff7f,
+    0xfffffeff, 0xfffffdff, 0xfffffbff, 0xfffff7ff,
+    0xffffefff, 0xffffdfff, 0xffffbfff, 0xffff7fff,
+    0xfffeffff, 0xfffdffff, 0xfffbffff, 0xfff7ffff,
+    0xffefffff, 0xffdfffff, 0xffbfffff, 0xff7fffff,
+    0xfeffffff, 0xfdffffff, 0xfbffffff, 0xf7ffffff,
+    0xefffffff, 0xdfffffff, 0xbfffffff, 0x7fffffff,
+    0xbfffffff, 0xdfffffff, 0xefffffff, 0xf7ffffff,
+    0xfbffffff, 0xfdffffff, 0xfeffffff, 0xff7fffff,
+    0xffbfffff, 0xffdfffff, 0xffefffff, 0xfff7ffff,
+    0xfffbffff, 0xfffdffff, 0xfffeffff, 0xffff7fff,
+    0xffffbfff, 0xffffdfff, 0xffffefff, 0xfffff7ff,
+    0xfffffbff, 0xfffffdff, 0xfffffeff, 0xffffff7f,
+    0xffffffbf, 0xffffffdf, 0xffffffef, 0xfffffff7,
+    0xfffffffb, 0xfffffffd, 0xfffffffe, 0xffffffff,
+]
+
+OneZero_data = [0x00000000, 0xffffffff]
+JustZero_data = [0x00000000, 0x00000000]
+JustOne_data = [0xffffffff, 0xffffffff]
+JustFive_data = [0x55555555, 0x55555555]
+JustA_data = [0xaaaaaaaa, 0xaaaaaaaa]
+FiveA_data = [0x55555555, 0xaaaaaaaa]
+FiveA8_data = [0x5aa5a55a, 0xa55a5aa5, 0xa55a5aa5, 0x5aa5a55a]
+Long8b10b_data = [0x16161616, 0x16161616]
+Short8b10b_data = [0xb5b5b5b5, 0xb5b5b5b5]
+Checker8b10b_data = [0xb5b5b5b5, 0x4a4a4a4a]
+Five7_data = [0x55555557, 0x55575555]
+Zero2fd_data = [0x00020002, 0xfffdfffd]
+
+FAMILIES = [
+    PatternFamily("walkingOnes",    walkingOnes_data,    (1, 1, 2, 1)),
+    PatternFamily("walkingInvOnes", walkingInvOnes_data, (2, 2, 5, 5)),
+    PatternFamily("walkingZeros",   walkingZeros_data,   (1, 1, 2, 1)),
+    PatternFamily("OneZero",        OneZero_data,        (5, 5, 15, 5)),
+    PatternFamily("JustZero",       JustZero_data,       (2, 0, 0, 0)),
+    PatternFamily("JustOne",        JustOne_data,        (2, 0, 0, 0)),
+    PatternFamily("JustFive",       JustFive_data,       (2, 0, 0, 0)),
+    PatternFamily("JustA",          JustA_data,          (2, 0, 0, 0)),
+    PatternFamily("FiveA",          FiveA_data,          (1, 1, 1, 1)),
+    PatternFamily("FiveA8",         FiveA8_data,         (1, 1, 1, 1)),
+    PatternFamily("Long8b10b",      Long8b10b_data,      (2, 0, 0, 0)),
+    PatternFamily("Short8b10b",     Short8b10b_data,     (2, 0, 0, 0)),
+    PatternFamily("Checker8b10b",   Checker8b10b_data,   (1, 0, 0, 1)),
+    PatternFamily("Five7",          Five7_data,          (0, 2, 0, 0)),
+    PatternFamily("Zero2fd",        Zero2fd_data,        (0, 2, 0, 0)),
+]
+
+
+def all_variants(include_zero_weight: bool = False) -> List[PatternVariant]:
+    """Return all pattern variants (optionally including zero-weight ones)."""
+    variants: List[PatternVariant] = []
+    for fam in FAMILIES:
+        for inv in (False, True):
+            for bw, w in zip((32, 64, 128, 256), fam.weights):
+                if not include_zero_weight and w <= 0:
+                    continue
+                variants.append(
+                    PatternVariant(
+                        family=fam,
+                        buswidth=bw,
+                        invert=inv,
+                        weight=w,
+                        busshift=_busshift(bw),
+                    )
+                )
+    return variants
+
+
+def top_k_by_weight(vars_: List[PatternVariant], k: int) -> List[PatternVariant]:
+    """Select the top-k variants by descending weight (deterministic)."""
+    ranked = sorted(vars_, key=lambda v: (-v.weight, v.label))
+    return ranked[:k]
+
+
+###############################################################################
+# B) Ramulator interactive client
+###############################################################################
+
+class RamulatorProc:
+    """A wrapper around a Ramulator interactive driver process.
+
+    The process must print `READY` when started, and then accept one of two
+    protocols for submitting requests: either a simpler `REQWAIT` form (A) or
+    a more detailed `REQ` form (B).  The class auto-detects which protocol
+    applies by probing the process.  See the user documentation for details.
+    """
+
+    def __init__(self, exe: str, config: str, max_cycles: int = 200_000):
+        self.exe = exe
+        self.config = config
+        self.max_cycles = max_cycles
+        self.proc: Optional[subprocess.Popen[str]] = None
+        self.proto: Optional[str] = None  # "A" or "B"
+
+    def start(self) -> None:
+        """Launch the driver and detect its protocol."""
+        self.proc = subprocess.Popen(
+            [self.exe, self.config],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        first = self.proc.stdout.readline().strip()
+        if first != "READY":
+            raise RuntimeError(f"Driver not READY. Got: {first}")
+
+        # Attempt to detect protocol by sending a probe.
+        probe = self._cmd("REQWAIT 0x100000 0 0")
+        if probe.startswith("OK") or probe == "STALLED":
+            self.proto = "A"
+            return
+
+        probe = self._cmd(f"REQ R 0x100000 0 {self.max_cycles}")
+        if probe.startswith("DONE") or probe.startswith("TIMEOUT") or probe == "STALLED":
+            self.proto = "B"
+            return
+
+        raise RuntimeError(f"Unknown driver protocol. Response: {probe}")
+
+    def _cmd(self, line: str) -> str:
+        assert self.proc is not None and self.proc.stdin and self.proc.stdout
+        self.proc.stdin.write(line + "\n")
+        self.proc.stdin.flush()
+        return self.proc.stdout.readline().strip()
+
+    def req(self, addr: int, is_write: bool, ctx: int = 0) -> Tuple[bool, Optional[int], str]:
+        """Issue a single memory request.
+
+        Returns (accepted, latency_cycles, raw_response).  If the request is
+        stalled or rejected, `accepted` will be False and `latency_cycles`
+        will be None.  For protocol B, the latency returned is the sum of
+        memory cycles for both the write and the read.
+        """
+        if self.proc is None:
+            raise RuntimeError("Ramulator driver has not been started")
+        addr_hex = hex(addr)
+
+        # Protocol A: REQWAIT <addr_hex> <is_write> <ctx>
+        if self.proto == "A":
+            resp = self._cmd(f"REQWAIT {addr_hex} {1 if is_write else 0} {ctx}")
+            if resp == "STALLED":
+                return False, None, resp
+            if resp.startswith("OK"):
+                parts = resp.split()
+                lat = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                return True, lat, resp
+            return False, None, resp
+
+        # Protocol B: REQ <R|W> <addr_hex> <ctx> <max_cycles>
+        if self.proto == "B":
+            rw = "W" if is_write else "R"
+            resp = self._cmd(f"REQ {rw} {addr_hex} {ctx} {self.max_cycles}")
+            if resp == "STALLED":
+                return False, None, resp
+            if resp.startswith("DONE") or resp.startswith("TIMEOUT"):
+                parts = resp.split()
+                lat = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else None
+                return True, lat, resp
+            return False, None, resp
+
+        raise RuntimeError("Protocol not determined")
+
+    def close(self) -> None:
+        """Terminate the driver process cleanly."""
+        if not self.proc:
+            return
+        try:
+            if self.proc.stdin:
+                self.proc.stdin.write("EXIT\n")
+                self.proc.stdin.flush()
+        except Exception:
+            pass
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
+        self.proc = None
+
+
+###############################################################################
+# C) Event definition and metrics
+###############################################################################
+
+def latency_tail(latencies: List[int]) -> Dict[str, Optional[float]]:
+    """Compute basic latency distribution metrics.
+
+    Returns a dictionary with p50, p95, p99 and mean.  If the list is empty
+    the values are None.  This function avoids using statistics module to
+    remain dependency-free.
+    """
+    if not latencies:
+        return {"p50": None, "p95": None, "p99": None, "mean": None}
+    s = sorted(latencies)
+    n = len(s)
+
+    def percentile(p: float) -> float:
+        idx = int(round(p / 100.0 * (n - 1)))
+        idx = max(0, min(idx, n - 1))
+        return float(s[idx])
+
+    mean_val = float(sum(s) / n)
+    return {
+        "p50": percentile(50),
+        "p95": percentile(95),
+        "p99": percentile(99),
+        "mean": mean_val,
+    }
+
+
+def is_event(accepted: bool, lat: Optional[int], raw: str, spike_thresh: int) -> bool:
+    """Determine whether a response qualifies as a 'fault event'."""
+    if not accepted:
+        return True  # STALLED or unknown errors
+    if raw.startswith("TIMEOUT"):
+        return True
+    if lat is not None and lat >= spike_thresh:
+        return True
+    return False
+
+
+###############################################################################
+# D) Core step logic
+###############################################################################
+
+def step_variant(
+    ram: RamulatorProc,
+    v: PatternVariant,
+    addr_base: int,
+    stride: int,
+    n_addrs: int,
+    ctx: int,
+    spike_thresh: int,
+) -> Tuple[bool, Optional[int], bool, str]:
+    """Perform a single write/read test on one address for the given variant.
+
+    The address is selected deterministically based on the variant label to
+    provide coverage across the address space.  Returns a tuple of
+    (accepted, latency_cycles, event, raw_response).
+    """
+    h = sum(ord(c) for c in v.label) & MASK32
+    idx = (h % n_addrs)
+    addr = addr_base + idx * stride
+
+    # Issue write then read
+    acc_w, lat_w, raw_w = ram.req(addr, True, ctx)
+    if not acc_w:
+        return False, None, True, raw_w
+    acc_r, lat_r, raw_r = ram.req(addr, False, ctx)
+    if not acc_r:
+        return False, None, True, raw_r
+
+    lat: Optional[int] = None
+    if lat_w is not None and lat_r is not None:
+        lat = lat_w + lat_r
+    event = is_event(True, lat, raw_r, spike_thresh)
+    return True, lat, event, raw_r
+
+
+###############################################################################
+# E) Baseline exhaustive and RL bandit logic
+###############################################################################
+
+def run_baseline(
+    ram_exe: str,
+    config: str,
+    action_set: List[PatternVariant],
+    steps_per_action: int,
+    addr_base: int,
+    stride: int,
+    n_addrs: int,
+    ctx: int,
+    spike_thresh: int,
+) -> Dict[str, Any]:
+    """Exhaustively apply each pattern variant a fixed number of times.
+
+    Returns a dictionary summarizing the run, including TTFF and event rate.
+    """
+    ram = RamulatorProc(ram_exe, config)
+    ram.start()
+
+    start = time.time()
+    first_event_t: Optional[float] = None
+    first_event_step: Optional[int] = None
+    first_event_action: Optional[str] = None
+
+    total_steps = 0
+    events = 0
+    latencies: List[int] = []
+    coverage = set()
+
+    for ai, v in enumerate(action_set):
+        for _ in range(steps_per_action):
+            accepted, lat, ev, _ = step_variant(
+                ram,
+                v,
+                addr_base=addr_base,
+                stride=stride,
+                n_addrs=n_addrs,
+                ctx=ctx,
+                spike_thresh=spike_thresh,
+            )
+            total_steps += 1
+            coverage.add(v.label)
+            if lat is not None:
+                latencies.append(lat)
+            if ev:
+                events += 1
+                if first_event_t is None:
+                    first_event_t = time.time()
+                    first_event_step = total_steps
+                    first_event_action = v.label
+
+    elapsed = time.time() - start
+    ttff_s = None if first_event_t is None else (first_event_t - start)
+    ram.close()
+    return {
+        "mode": "baseline",
+        "elapsed_s": elapsed,
+        "total_steps": total_steps,
+        "actions": len(action_set),
+        "steps_per_action": steps_per_action,
+        "events": events,
+        "events_per_min": (events / (elapsed / 60.0)) if elapsed > 0 else None,
+        "ttff_s": ttff_s,
+        "ttff_steps": first_event_step,
+        "ttff_action": first_event_action,
+        "coverage_actions": len(coverage),
+        "latency_tail": latency_tail(latencies),
+    }
+
+
+def train_bandit(
+    ram_exe: str,
+    config: str,
+    action_set: List[PatternVariant],
+    episodes: int,
+    steps_per_ep: int,
+    epsilon: float,
+    alpha: float,
+    addr_base: int,
+    stride: int,
+    n_addrs: int,
+    ctx: int,
+    spike_thresh: int,
+    seed: int,
+) -> Dict[str, Any]:
+    """Train a simple ε-greedy bandit over the pattern variants.
+
+    Returns a report containing the learned Q values, coverage statistics and
+    TTFF.  A reward of 100 is given for each fault event, plus a small
+    bonus proportional to latency to encourage exploring higher latency
+    operations.
+    """
+    rng = random.Random(seed)
+    ram = RamulatorProc(ram_exe, config)
+    ram.start()
+
+    K = len(action_set)
+    Q = [0.0] * K
+    pulls = [0] * K
+
+    start = time.time()
+    first_event_t: Optional[float] = None
+    first_event_step: Optional[int] = None
+    first_event_action: Optional[str] = None
+
+    total_steps = 0
+    events = 0
+    latencies: List[int] = []
+    coverage = set()
+
+    def reward_fn(ev: bool, lat: Optional[int]) -> float:
+        r = 0.0
+        if ev:
+            r += 100.0
+        if lat is not None:
+            r += min(lat / 1000.0, 10.0)
+        return r
+
+    for ep in range(episodes):
+        for _ in range(steps_per_ep):
+            # Choose action using ε-greedy strategy.
+            if rng.random() < epsilon:
+                a = rng.randrange(K)
+            else:
+                a = max(range(K), key=lambda i: Q[i])
+            v = action_set[a]
+            coverage.add(v.label)
+            accepted, lat, ev, _ = step_variant(
+                ram,
+                v,
+                addr_base=addr_base,
+                stride=stride,
+                n_addrs=n_addrs,
+                ctx=ctx,
+                spike_thresh=spike_thresh,
+            )
+            total_steps += 1
+            if lat is not None:
+                latencies.append(lat)
+            if ev:
+                events += 1
+                if first_event_t is None:
+                    first_event_t = time.time()
+                    first_event_step = total_steps
+                    first_event_action = v.label
+            # Bandit update
+            pulls[a] += 1
+            r = reward_fn(ev, lat)
+            Q[a] = Q[a] + alpha * (r - Q[a])
+        # Progress log at 25%, 50%, 75% and end.
+        if (ep + 1) in {max(1, episodes // 4), max(1, episodes // 2), max(1, (3 * episodes) // 4), episodes}:
+            best_idx = max(range(K), key=lambda i: Q[i])
+            print(
+                f"[train] ep={ep+1}/{episodes} best={action_set[best_idx].label} "
+                f"Q={Q[best_idx]:.2f} events={events}",
+            )
+
+    elapsed = time.time() - start
+    ttff_s = None if first_event_t is None else (first_event_t - start)
+    best_idx = max(range(K), key=lambda i: Q[i])
+    ram.close()
+    return {
+        "mode": "train",
+        "seed": seed,
+        "episodes": episodes,
+        "steps_per_ep": steps_per_ep,
+        "epsilon": epsilon,
+        "alpha": alpha,
+        "elapsed_s": elapsed,
+        "total_steps": total_steps,
+        "events": events,
+        "events_per_min": (events / (elapsed / 60.0)) if elapsed > 0 else None,
+        "ttff_s": ttff_s,
+        "ttff_steps": first_event_step,
+        "ttff_action": first_event_action,
+        "coverage_actions": len(coverage),
+        "latency_tail": latency_tail(latencies),
+        "best_index": best_idx,
+        "best_action": action_set[best_idx].label,
+        "Q": Q,
+        "pulls": pulls,
+        "action_labels": [v.label for v in action_set],
+    }
+
+
+def eval_best(
+    ram_exe: str,
+    config: str,
+    action_set: List[PatternVariant],
+    best_action_label: str,
+    eval_steps: int,
+    addr_base: int,
+    stride: int,
+    n_addrs: int,
+    ctx: int,
+    spike_thresh: int,
+) -> Dict[str, Any]:
+    """Evaluate one pattern variant for a number of steps and gather stats."""
+    label_to_idx = {v.label: i for i, v in enumerate(action_set)}
+    if best_action_label not in label_to_idx:
+        raise ValueError(
+            f"best_action_label '{best_action_label}' not found in current action_set"
+        )
+    best_variant = action_set[label_to_idx[best_action_label]]
+    ram = RamulatorProc(ram_exe, config)
+    ram.start()
+    start = time.time()
+    first_event_t: Optional[float] = None
+    first_event_step: Optional[int] = None
+    events = 0
+    latencies: List[int] = []
+    coverage = {best_variant.label}
+    for step in range(1, eval_steps + 1):
+        accepted, lat, ev, _ = step_variant(
+            ram,
+            best_variant,
+            addr_base=addr_base,
+            stride=stride,
+            n_addrs=n_addrs,
+            ctx=ctx,
+            spike_thresh=spike_thresh,
+        )
+        if lat is not None:
+            latencies.append(lat)
+        if ev:
+            events += 1
+            if first_event_t is None:
+                first_event_t = time.time()
+                first_event_step = step
+    elapsed = time.time() - start
+    ttff_s = None if first_event_t is None else (first_event_t - start)
+    ram.close()
+    return {
+        "mode": "eval",
+        "best_action": best_variant.label,
+        "elapsed_s": elapsed,
+        "eval_steps": eval_steps,
+        "events": events,
+        "events_per_min": (events / (elapsed / 60.0)) if elapsed > 0 else None,
+        "ttff_s": ttff_s,
+        "ttff_steps": first_event_step,
+        "coverage_actions": len(coverage),
+        "latency_tail": latency_tail(latencies),
+    }
+
+
+###############################################################################
+# F) CLI
+###############################################################################
+
+def make_action_set(kind: str) -> List[PatternVariant]:
+    """Return the appropriate action set by type."""
+    variants = all_variants(include_zero_weight=False)
+    if kind == "all":
+        return variants
+    if kind == "top64":
+        return top_k_by_weight(variants, 64)
+    raise ValueError("action_set must be 'top64' or 'all'")
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="GSAT RL and baseline runner")
+    ap.add_argument(
+        "--exe",
+        required=True,
+        help="Path to the interactive driver executable (must print READY)",
+    )
+    ap.add_argument(
+        "--config",
+        required=True,
+        help="Path to the YAML config used by the driver",
+    )
+
+    # Prefer underscore options (no shell/argparse surprises). Keep hyphen aliases too.
+    ap.add_argument(
+        "--action_set",
+        "--action-set",
+        dest="action_set",
+        default="top64",
+        choices=["top64", "all"],
+        help="Use top64 weighted variants or all selectable variants",
+    )
+    ap.add_argument(
+        "--addr_base",
+        "--addr-base",
+        dest="addr_base",
+        type=lambda x: int(x, 0),
+        default=0x100000,
+        help="Base address (hex or decimal)",
+    )
+    ap.add_argument("--stride", type=int, default=64, help="Stride in bytes")
+    ap.add_argument(
+        "--n_addrs",
+        "--n-addrs",
+        dest="n_addrs",
+        type=int,
+        default=1024,
+        help="Address window size (count)",
+    )
+    ap.add_argument("--ctx", type=int, default=0, help="Context ID")
+    ap.add_argument(
+        "--spike_thresh",
+        "--spike-thresh",
+        dest="spike_thresh",
+        type=int,
+        default=4000,
+        help="Latency threshold in cycles to consider a spike",
+    )
+
+    subparsers = ap.add_subparsers(dest="cmd", required=True)
+
+    b = subparsers.add_parser("baseline", help="Run baseline exhaustive test")
+    b.add_argument(
+        "--steps_per_action",
+        "--steps-per-action",
+        dest="steps_per_action",
+        type=int,
+        default=200,
+        help="Steps per action variant",
+    )
+
+    t = subparsers.add_parser("train", help="Train RL agent")
+    t.add_argument("--episodes", type=int, default=200, help="Number of episodes")
+    t.add_argument(
+        "--steps_per_ep",
+        "--steps-per-ep",
+        dest="steps_per_ep",
+        type=int,
+        default=50,
+        help="Steps per episode",
+    )
+    t.add_argument("--epsilon", type=float, default=0.2, help="Exploration rate")
+    t.add_argument("--alpha", type=float, default=0.1, help="Learning rate")
+    t.add_argument("--seed", type=int, default=1, help="Random seed")
+    t.add_argument("--out", default="rl_model.json", help="Output model file")
+
+    e = subparsers.add_parser("eval", help="Evaluate a saved RL model")
+    e.add_argument("--model", required=True, help="Model JSON from training")
+    e.add_argument(
+        "--eval_steps",
+        "--eval-steps",
+        dest="eval_steps",
+        type=int,
+        default=2000,
+        help="Steps for evaluation",
+    )
+
+    c = subparsers.add_parser("compare", help="Baseline vs RL comparison")
+    c.add_argument(
+        "--steps_per_action",
+        "--steps-per-action",
+        dest="steps_per_action",
+        type=int,
+        default=200,
+        help="Steps per action in baseline",
+    )
+    c.add_argument("--episodes", type=int, default=200)
+    c.add_argument(
+        "--steps_per_ep",
+        "--steps-per-ep",
+        dest="steps_per_ep",
+        type=int,
+        default=50,
+    )
+    c.add_argument("--epsilon", type=float, default=0.2)
+    c.add_argument("--alpha", type=float, default=0.1)
+    c.add_argument("--seed", type=int, default=1)
+    c.add_argument(
+        "--eval_steps",
+        "--eval-steps",
+        dest="eval_steps",
+        type=int,
+        default=2000,
+    )
+    c.add_argument("--out", default="compare_report.json")
+
+    args = ap.parse_args()
+    action_set = make_action_set(args.action_set)
+
+    if args.cmd == "baseline":
+        report = run_baseline(
+            ram_exe=args.exe,
+            config=args.config,
+            action_set=action_set,
+            steps_per_action=args.steps_per_action,
+            addr_base=args.addr_base,
+            stride=args.stride,
+            n_addrs=args.n_addrs,
+            ctx=args.ctx,
+            spike_thresh=args.spike_thresh,
+        )
+        print(json.dumps(report, indent=2))
+        return
+
+    if args.cmd == "train":
+        report = train_bandit(
+            ram_exe=args.exe,
+            config=args.config,
+            action_set=action_set,
+            episodes=args.episodes,
+            steps_per_ep=args.steps_per_ep,
+            epsilon=args.epsilon,
+            alpha=args.alpha,
+            addr_base=args.addr_base,
+            stride=args.stride,
+            n_addrs=args.n_addrs,
+            ctx=args.ctx,
+            spike_thresh=args.spike_thresh,
+            seed=args.seed,
+        )
+        # Save model
+        out = {
+            "meta": {
+                "exe": args.exe,
+                "config": args.config,
+                "action_set": args.action_set,
+                "spike_thresh": args.spike_thresh,
+                "addr_base": args.addr_base,
+                "stride": args.stride,
+                "n_addrs": args.n_addrs,
+                "ctx": args.ctx,
+            },
+            "train_report": {k: report[k] for k in report if k not in ("Q", "pulls", "action_labels")},
+            "Q": report["Q"],
+            "pulls": report["pulls"],
+            "action_labels": report["action_labels"],
+            "best_action": report["best_action"],
+        }
+        with open(args.out, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"\nSaved model: {args.out}")
+        print(f"Best action: {report['best_action']}")
+        return
+
+    if args.cmd == "eval":
+        with open(args.model) as f:
+            model = json.load(f)
+        best_action = model["best_action"]
+        report = eval_best(
+            ram_exe=args.exe,
+            config=args.config,
+            action_set=action_set,
+            best_action_label=best_action,
+            eval_steps=args.eval_steps,
+            addr_base=args.addr_base,
+            stride=args.stride,
+            n_addrs=args.n_addrs,
+            ctx=args.ctx,
+            spike_thresh=args.spike_thresh,
+        )
+        print(json.dumps(report, indent=2))
+        return
+
+    if args.cmd == "compare":
+        base = run_baseline(
+            ram_exe=args.exe,
+            config=args.config,
+            action_set=action_set,
+            steps_per_action=args.steps_per_action,
+            addr_base=args.addr_base,
+            stride=args.stride,
+            n_addrs=args.n_addrs,
+            ctx=args.ctx,
+            spike_thresh=args.spike_thresh,
+        )
+        print("\n[compare] baseline done")
+
+        train_rep = train_bandit(
+            ram_exe=args.exe,
+            config=args.config,
+            action_set=action_set,
+            episodes=args.episodes,
+            steps_per_ep=args.steps_per_ep,
+            epsilon=args.epsilon,
+            alpha=args.alpha,
+            addr_base=args.addr_base,
+            stride=args.stride,
+            n_addrs=args.n_addrs,
+            ctx=args.ctx,
+            spike_thresh=args.spike_thresh,
+            seed=args.seed,
+        )
+        best_action = train_rep["best_action"]
+        print("\n[compare] train done, best =", best_action)
+
+        ev = eval_best(
+            ram_exe=args.exe,
+            config=args.config,
+            action_set=action_set,
+            best_action_label=best_action,
+            eval_steps=args.eval_steps,
+            addr_base=args.addr_base,
+            stride=args.stride,
+            n_addrs=args.n_addrs,
+            ctx=args.ctx,
+            spike_thresh=args.spike_thresh,
+        )
+        print("\n[compare] eval done")
+
+        summary = {
+            "baseline_ttff_s": base.get("ttff_s"),
+            "rl_train_ttff_s": train_rep.get("ttff_s"),
+            "rl_eval_ttff_s": ev.get("ttff_s"),
+            "baseline_events_per_min": base.get("events_per_min"),
+            "rl_train_events_per_min": train_rep.get("events_per_min"),
+            "rl_eval_events_per_min": ev.get("events_per_min"),
+            "best_action": best_action,
+        }
+
+        report = {
+            "baseline": base,
+            "train": {k: train_rep[k] for k in train_rep if k not in ("Q", "pulls", "action_labels")},
+            "eval_best": ev,
+            "summary": summary,
+        }
+
+        with open(args.out, "w") as f:
+            json.dump(report, f, indent=2)
+        print(f"\nSaved compare report: {args.out}")
+        print(json.dumps(summary, indent=2))
+        return
+
+    raise RuntimeError("No valid subcommand provided")
+
+
+if __name__ == "__main__":
+    main()
+
+    main()
+
+
+
+
+#!/usr/bin/env python3
+# gsat_rl_allinone.py
+#
 # One‑file end‑to‑end: training and evaluation of stress patterns on a
 # memory system.  The module includes a complete, hard‑coded catalog of
 # the patterns defined in the original Google "pattern.cc" (64‑ and
