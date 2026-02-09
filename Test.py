@@ -1,3 +1,865 @@
+#!/usr/bin/env python3
+"""
+rlmem_final.py
+
+Phase-1: CE induction on known-CE devices using legacy GSAT patterns.
+Phase-2: Pattern discovery (GSAT + generated patterns) to discover new DRAM defects/signatures.
+
+No external deps (stdlib only).
+
+Example runs:
+  # Phase-1: train and evaluate (GSAT only)
+  python rlmem_final.py train --phase 1 --episodes 300 --steps 8 --region-kb 64 --out pol_p1.json
+  python rlmem_final.py eval  --phase 1 --episodes 80  --steps 8 --region-kb 64 --policy pol_p1.json
+
+  # Phase-2: train and evaluate (GSAT + generator actions)
+  python rlmem_final.py train --phase 2 --episodes 500 --steps 10 --region-kb 64 --out pol_p2.json
+  python rlmem_final.py eval  --phase 2 --episodes 120 --steps 10 --region-kb 64 --policy pol_p2.json
+
+  # Compare strategies
+  python rlmem_final.py compare --phase 1 --episodes 80 --steps 8  --region-kb 64 --policy pol_p1.json
+  python rlmem_final.py compare --phase 2 --episodes 80 --steps 10 --region-kb 64 --policy pol_p2.json
+"""
+
+from __future__ import annotations
+import argparse
+import json
+import math
+import random
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple, Callable
+from array import array
+
+
+# =========================
+# 0) Helpers
+# =========================
+
+def u32(x: int) -> int:
+    return x & 0xFFFFFFFF
+
+def popcount32(x: int) -> int:
+    return (x & 0xFFFFFFFF).bit_count()
+
+def rotl32(x: int, r: int) -> int:
+    r &= 31
+    return u32((x << r) | (x >> (32 - r)))
+
+def bitswap32(x: int, mode: int) -> int:
+    """
+    Deterministic "bit permutation" family (cheap, stdlib-only).
+    mode 0: identity
+    mode 1: reverse bits
+    mode 2: swap nibbles
+    mode 3: rotate 13
+    mode 4: xor-fold
+    """
+    x = u32(x)
+    if mode == 0:
+        return x
+    if mode == 1:
+        # reverse bits
+        y = 0
+        for i in range(32):
+            y = (y << 1) | ((x >> i) & 1)
+        return u32(y)
+    if mode == 2:
+        # swap nibbles
+        y = 0
+        for i in range(8):
+            nib = (x >> (i * 4)) & 0xF
+            y |= nib << ((7 - i) * 4)
+        return u32(y)
+    if mode == 3:
+        return rotl32(x, 13)
+    # mode 4
+    y = x ^ (x >> 16)
+    y = u32(y ^ (y >> 8))
+    return y
+
+
+# =========================
+# 1) Legacy GSAT patterns (from pattern.cc subset)
+# =========================
+
+walkingOnes_data = [
+  0x00000001, 0x00000002, 0x00000004, 0x00000008,
+  0x00000010, 0x00000020, 0x00000040, 0x00000080,
+  0x00000100, 0x00000200, 0x00000400, 0x00000800,
+  0x00001000, 0x00002000, 0x00004000, 0x00008000,
+  0x00010000, 0x00020000, 0x00040000, 0x00080000,
+  0x00100000, 0x00200000, 0x00400000, 0x00800000,
+  0x01000000, 0x02000000, 0x04000000, 0x08000000,
+  0x10000000, 0x20000000, 0x40000000, 0x80000000,
+  0x40000000, 0x20000000, 0x10000000, 0x08000000,
+  0x04000000, 0x02000000, 0x01000000, 0x00800000,
+  0x00400000, 0x00200000, 0x00100000, 0x00080000,
+  0x00040000, 0x00020000, 0x00010000, 0x00008000,
+  0x00004000, 0x00002000, 0x00001000, 0x00000800,
+  0x00000400, 0x00000200, 0x00000100, 0x00000080,
+  0x00000040, 0x00000020, 0x00000010, 0x00000008,
+  0x00000004, 0x00000002, 0x00000001, 0x00000000
+]
+walkingInvOnes_data = [
+  0x00000001, 0xfffffffe, 0x00000002, 0xfffffffd,
+  0x00000004, 0xfffffffb, 0x00000008, 0xfffffff7,
+  0x00000010, 0xffffffef, 0x00000020, 0xffffffdf,
+  0x00000040, 0xffffffbf, 0x00000080, 0xffffff7f,
+  0x00000100, 0xfffffeff, 0x00000200, 0xfffffdff,
+  0x00000400, 0xfffffbff, 0x00000800, 0xfffff7ff,
+  0x00001000, 0xffffefff, 0x00002000, 0xffffdfff,
+  0x00004000, 0xffffbfff, 0x00008000, 0xffff7fff,
+  0x00010000, 0xfffeffff, 0x00020000, 0xfffdffff,
+  0x00040000, 0xfffbffff, 0x00080000, 0xfff7ffff,
+  0x00100000, 0xffefffff, 0x00200000, 0xffdfffff,
+  0x00400000, 0xffbfffff, 0x00800000, 0xff7fffff,
+  0x01000000, 0xfeffffff, 0x02000000, 0xfdffffff,
+  0x04000000, 0xfbffffff, 0x08000000, 0xf7ffffff,
+  0x10000000, 0xefffffff, 0x20000000, 0xdfffffff,
+  0x40000000, 0xbfffffff, 0x80000000, 0x7fffffff,
+  0x40000000, 0xbfffffff, 0x20000000, 0xdfffffff,
+  0x10000000, 0xefffffff, 0x08000000, 0xf7ffffff,
+  0x04000000, 0xfbffffff, 0x02000000, 0xfdffffff,
+  0x01000000, 0xfeffffff, 0x00800000, 0xff7fffff,
+  0x00400000, 0xffbfffff, 0x00200000, 0xffdfffff,
+  0x00100000, 0xffefffff, 0x00080000, 0xfff7ffff,
+  0x00040000, 0xfffbffff, 0x00020000, 0xfffdffff,
+  0x00010000, 0xfffeffff, 0x00008000, 0xffff7fff,
+  0x00004000, 0xffffbfff, 0x00002000, 0xffffdfff,
+  0x00001000, 0xffffefff, 0x00000800, 0xfffff7ff,
+  0x00000400, 0xfffffbff, 0x00000200, 0xfffffdff,
+  0x00000100, 0xfffffeff, 0x00000080, 0xffffff7f,
+  0x00000040, 0xffffffbf, 0x00000020, 0xffffffdf,
+  0x00000010, 0xffffffef, 0x00000008, 0xfffffff7,
+  0x00000004, 0xfffffffb, 0x00000002, 0xfffffffd,
+  0x00000001, 0xfffffffe, 0x00000000, 0xffffffff
+]
+walkingZeros_data = [
+  0xfffffffe, 0xfffffffd, 0xfffffffb, 0xfffffff7,
+  0xffffffef, 0xffffffdf, 0xffffffbf, 0xffffff7f,
+  0xfffffeff, 0xfffffdff, 0xfffffbff, 0xfffff7ff,
+  0xffffefff, 0xffffdfff, 0xffffbfff, 0xffff7fff,
+  0xfffeffff, 0xfffdffff, 0xfffbffff, 0xfff7ffff,
+  0xffefffff, 0xffdfffff, 0xffbfffff, 0xff7fffff,
+  0xfeffffff, 0xfdffffff, 0xfbffffff, 0xf7ffffff,
+  0xefffffff, 0xdfffffff, 0xbfffffff, 0x7fffffff,
+  0xbfffffff, 0xdfffffff, 0xefffffff, 0xf7ffffff,
+  0xfbffffff, 0xfdffffff, 0xfeffffff, 0xff7fffff,
+  0xffbfffff, 0xffdfffff, 0xffefffff, 0xfff7ffff,
+  0xfffbffff, 0xfffdffff, 0xfffeffff, 0xffff7fff,
+  0xffffbfff, 0xffffdfff, 0xffffefff, 0xfffff7ff,
+  0xfffffbff, 0xfffffdff, 0xfffffeff, 0xffffff7f,
+  0xffffffbf, 0xffffffdf, 0xffffffef, 0xfffffff7,
+  0xfffffffb, 0xfffffffd, 0xfffffffe, 0xffffffff
+]
+
+LEGACY_GSAT: Dict[str, List[int]] = {
+    "walkingOnes": walkingOnes_data,
+    "walkingInvOnes": walkingInvOnes_data,
+    "walkingZeros": walkingZeros_data,
+    "OneZero": [0x00000000, 0xffffffff],
+    "JustZero": [0x00000000, 0x00000000],
+    "JustOne": [0xffffffff, 0xffffffff],
+    "JustFive": [0x55555555, 0x55555555],
+    "JustA": [0xaaaaaaaa, 0xaaaaaaaa],
+    "FiveA": [0x55555555, 0xaaaaaaaa],
+    "FiveA8": [0x5aa5a55a, 0xa55a5aa5, 0xa55a5aa5, 0x5aa5a55a],
+    "Long8b10b": [0x16161616, 0x16161616],
+    "Short8b10b": [0xb5b5b5b5, 0xb5b5b5b5],
+    "Checker8b10b": [0xb5b5b5b5, 0x4a4a4a4a],
+    "Five7": [0x55555557, 0x55575555],
+    "Zero2fd": [0x00020002, 0xfffdfffd],
+}
+
+BUSSHIFT = {32: 0, 64: 1, 128: 2, 256: 3}
+WIDTHS = [32, 64, 128, 256]
+
+def build_legacy_actions() -> List[Dict]:
+    actions = []
+    for name, vals in LEGACY_GSAT.items():
+        for bw in WIDTHS:
+            for inv in (False, True):
+                actions.append({
+                    "kind": "gsat",
+                    "pattern": name,
+                    "vals": vals,
+                    "buswidth": bw,
+                    "busshift": BUSSHIFT[bw],
+                    "invert": inv,
+                    "variant_name": f"GSAT:{name}{'~' if inv else ''}_{bw}"
+                })
+    return actions
+
+def lfsr32_step(x: int) -> int:
+    # Simple xorshift32 (fast, deterministic, ok for pattern gen)
+    x = u32(x)
+    x ^= u32(x << 13)
+    x ^= u32(x >> 17)
+    x ^= u32(x << 5)
+    return u32(x)
+
+def build_generator_actions() -> List[Dict]:
+    """
+    Phase-2: actions that let the agent 'invent' patterns.
+
+    Each action defines a pattern generator:
+      - seed
+      - bitswap mode
+      - invert
+      - busshift (like GSAT width effect)
+      - address stride / hotset to create locality/hammer pressure
+    """
+    actions = []
+    seeds = [0x12345678, 0x87654321, 0xA5A5A5A5, 0x1, 0xDEADBEEF]
+    swap_modes = [0, 1, 2, 3, 4]
+    strides = [1, 2, 4, 8, 16]          # in 32-bit words
+    hotsets = [0, 64, 256, 1024]        # if >0: repeatedly hit within first hotset words
+
+    for seed in seeds:
+        for sm in swap_modes:
+            for inv in (False, True):
+                for bw in (32, 64, 128, 256):
+                    for stride in strides:
+                        for hot in hotsets:
+                            actions.append({
+                                "kind": "gen",
+                                "seed": seed,
+                                "swap_mode": sm,
+                                "invert": inv,
+                                "busshift": BUSSHIFT[bw],
+                                "buswidth": bw,
+                                "stride": stride,
+                                "hotset_words": hot,
+                                "variant_name": f"GEN:seed={seed:08x},swap={sm},inv={int(inv)},bw={bw},str={stride},hot={hot}"
+                            })
+    return actions
+
+
+# =========================
+# 2) Fault model (two regimes: Phase-1 CE devices, Phase-2 discovery)
+# =========================
+
+@dataclass
+class FaultConfig:
+    seed: int = 0
+    # Phase-1: "known CE devices": stronger single-bit stuck/weak bits
+    ce_site_prob: float = 5e-6         # more likely CE sites exist
+    ce_flip_prob: float = 0.0          # optional transient CE on read
+
+    # Phase-2: additional defect types
+    retention_prob: float = 2e-6
+    retention_flip_after: int = 40_000
+
+    hammer_threshold: int = 6_000
+    hammer_flip_prob: float = 2e-3
+
+    intermittent_prob: float = 1e-8
+
+    # multi-bit burst/UE-like (mostly Phase-2)
+    burst_prob: float = 2e-7
+    burst_width_min: int = 2
+    burst_width_max: int = 4
+
+    cacheline_bytes: int = 64
+
+
+class FaultModel:
+    """
+    Read-time corruption model.
+
+    Phase-1: primarily CE (single-bit stuck).
+    Phase-2: CE + retention + hammer + intermittent + burst (multi-bit).
+    """
+    def __init__(self, cfg: FaultConfig, mem_words: int, phase: int):
+        self.cfg = cfg
+        self.rng = random.Random(cfg.seed)
+        self.mem_words = mem_words
+        self.phase = phase
+
+        self.time = 0
+        self.last_fault_type = "none"
+
+        # Hard faults: idx -> (mask, forced_bits)
+        self.hard_mask: Dict[int, int] = {}
+        self.hard_forced: Dict[int, int] = {}
+
+        # Retention: idx -> (bit, flip_time)
+        self.retention: Dict[int, Tuple[int, int]] = {}
+
+        # Hammer counters: cacheline -> count
+        self.cl_access: Dict[int, int] = {}
+
+        # Inject CE sites always (phase1+phase2)
+        for i in range(mem_words):
+            if self.rng.random() < cfg.ce_site_prob:
+                bit = self.rng.randrange(32)
+                self._add_hard(i, bit, is_burst=False)
+
+        # Inject Phase-2 extras
+        if phase >= 2:
+            for i in range(mem_words):
+                if self.rng.random() < cfg.burst_prob:
+                    bit_start = self.rng.randrange(28)
+                    width = self.rng.randint(cfg.burst_width_min, cfg.burst_width_max)
+                    for b in range(bit_start, bit_start + width):
+                        self._add_hard(i, b, is_burst=True)
+
+                if self.rng.random() < cfg.retention_prob:
+                    bit = self.rng.randrange(32)
+                    flip_t = max(1, cfg.retention_flip_after + self.rng.randint(-5000, 5000))
+                    self.retention[i] = (bit, flip_t)
+
+    def _add_hard(self, idx: int, bit: int, is_burst: bool):
+        mask = self.hard_mask.get(idx, 0) | (1 << bit)
+        self.hard_mask[idx] = mask
+
+        forced = self.hard_forced.get(idx, 0)
+        # randomly force bit to 0 or 1
+        if self.rng.getrandbits(1):
+            forced |= (1 << bit)
+        else:
+            forced &= ~(1 << bit)
+        self.hard_forced[idx] = forced
+
+    def on_time(self, t: int):
+        self.time = t
+
+    def on_access(self, addr: int):
+        cl = addr // self.cfg.cacheline_bytes
+        self.cl_access[cl] = self.cl_access.get(cl, 0) + 1
+
+    def apply_on_read(self, addr: int, idx: int, val: int) -> int:
+        self.last_fault_type = "none"
+        v = u32(val)
+        orig = v
+
+        # Hammer (phase2)
+        if self.phase >= 2:
+            cl = addr // self.cfg.cacheline_bytes
+            if self.cl_access.get(cl, 0) > self.cfg.hammer_threshold:
+                if self.rng.random() < self.cfg.hammer_flip_prob:
+                    bit = self.rng.randrange(32)
+                    v ^= (1 << bit)
+                    self.last_fault_type = "hammer"
+
+            # Retention (phase2)
+            if idx in self.retention:
+                bit, flip_t = self.retention[idx]
+                if self.time >= flip_t:
+                    v ^= (1 << bit)
+                    if self.last_fault_type == "none":
+                        self.last_fault_type = "retention"
+
+            # Intermittent (phase2)
+            if self.rng.random() < self.cfg.intermittent_prob:
+                bit = self.rng.randrange(32)
+                v ^= (1 << bit)
+                if self.last_fault_type == "none":
+                    self.last_fault_type = "intermittent"
+
+        # Optional transient CE (phase1 can use it too if you want)
+        if self.cfg.ce_flip_prob > 0 and self.rng.random() < self.cfg.ce_flip_prob:
+            bit = self.rng.randrange(32)
+            v ^= (1 << bit)
+            if self.last_fault_type == "none":
+                self.last_fault_type = "ce_transient"
+
+        # Hard stuck/burst faults (always)
+        if idx in self.hard_mask:
+            mask = self.hard_mask[idx]
+            forced = self.hard_forced[idx]
+            v = (v & ~mask) | (forced & mask)
+            if v != orig:
+                if popcount32(mask) > 1:
+                    self.last_fault_type = "burst_ue"
+                else:
+                    self.last_fault_type = "stuck_ce"
+
+        return u32(v)
+
+
+# =========================
+# 3) Backend + runner
+# =========================
+
+@dataclass
+class ErrorEvent:
+    addr: int
+    expected: int
+    observed: int
+    bitmask: int
+    fault_type: str
+    is_ue: bool
+
+class DRAMBackend:
+    def __init__(self, mem_bytes: int, fault: FaultModel):
+        assert mem_bytes % 4 == 0
+        self.mem_words = mem_bytes // 4
+        self.mem = array('I', [0] * self.mem_words)
+        self.fault = fault
+        self.time = 0
+
+    def write32(self, addr: int, val: int):
+        idx = (addr >> 2) % self.mem_words
+        self.mem[idx] = u32(val)
+        self.time += 1
+        self.fault.on_time(self.time)
+        self.fault.on_access(addr)
+
+    def read32(self, addr: int) -> int:
+        idx = (addr >> 2) % self.mem_words
+        self.time += 1
+        self.fault.on_time(self.time)
+        self.fault.on_access(addr)
+        raw = int(self.mem[idx])
+        return int(self.fault.apply_on_read(addr, idx, raw))
+
+
+def sat_or_gen_fill_verify(
+    backend: DRAMBackend,
+    base_addr: int,
+    size_bytes: int,
+    action: Dict
+) -> List[ErrorEvent]:
+    """
+    Executes one action: either legacy GSAT pattern or generated pattern.
+    Always does write pass then verify pass.
+    """
+    words = size_bytes // 4
+    errors: List[ErrorEvent] = []
+
+    kind = action["kind"]
+    busshift = action["busshift"]
+    invert = action.get("invert", False)
+
+    # address schedule
+    stride = 1
+    hotset = 0
+    if kind == "gen":
+        stride = int(action["stride"])
+        hotset = int(action["hotset_words"])
+
+    def addr_of(w: int) -> int:
+        # If hotset_words > 0, concentrate accesses into a small region for hammer discovery.
+        if hotset > 0:
+            # Map w into [0, hotset) using stride
+            idx = (w * stride) % hotset
+        else:
+            idx = (w * stride) % words
+        return base_addr + idx * 4
+
+    # value schedule
+    if kind == "gsat":
+        vals = action["vals"]
+        def val_of(w: int) -> int:
+            pi = (w >> busshift) % len(vals)
+            v = vals[pi]
+            return u32(~v) if invert else u32(v)
+
+    else:
+        seed = int(action["seed"])
+        swap_mode = int(action["swap_mode"])
+        # Generator produces a stream; busshift changes how fast it advances
+        def val_of(w: int) -> int:
+            # advance generator every 2^busshift words
+            x = seed
+            steps = (w >> busshift) + 1
+            for _ in range(steps):
+                x = lfsr32_step(x)
+            v = bitswap32(x, swap_mode)
+            return u32(~v) if invert else u32(v)
+
+    # WRITE
+    for w in range(words):
+        backend.write32(addr_of(w), val_of(w))
+
+    # VERIFY
+    for w in range(words):
+        addr = addr_of(w)
+        exp = val_of(w)
+        got = backend.read32(addr)
+        if got != exp:
+            diff = u32(exp ^ got)
+            is_ue = popcount32(diff) > 1
+            errors.append(ErrorEvent(
+                addr=addr,
+                expected=exp,
+                observed=got,
+                bitmask=diff,
+                fault_type=backend.fault.last_fault_type,
+                is_ue=is_ue
+            ))
+
+    return errors
+
+
+# =========================
+# 4) Environment + signatures
+# =========================
+
+@dataclass
+class StepResult:
+    dt: int
+    errors: int
+    new_sigs: int
+    ce_count: int
+    ue_count: int
+    first_error_time: Optional[int]
+
+def signature_phase1(e: ErrorEvent) -> Tuple:
+    """
+    Phase-1: you WANT reproducible CE induction on known-CE devices.
+    So signature focuses on CE location class and bit behavior.
+    """
+    page = e.addr // 4096
+    # bucket bitmask lightly: popcount + low 8 bits
+    bm = (popcount32(e.bitmask) << 8) | (e.bitmask & 0xFF)
+    return ("CE" if not e.is_ue else "UE", e.fault_type, page, bm)
+
+def signature_phase2(e: ErrorEvent) -> Tuple:
+    """
+    Phase-2: you want discovery of *new* defects.
+    Keep signature richer so novelty is real.
+    """
+    page = e.addr // 4096
+    # use full bitmask (more strict novelty)
+    return ("UE" if e.is_ue else "CE", e.fault_type, page, e.bitmask)
+
+class SatEnv:
+    def __init__(self, mem_mb: int, region_kb: int, phase: int, seed: int):
+        self.mem_bytes = mem_mb * 1024 * 1024
+        self.region_bytes = min(region_kb * 1024, self.mem_bytes)
+        self.phase = phase
+        self.seed = seed
+
+        self.actions = build_legacy_actions()
+        if phase >= 2:
+            self.actions += build_generator_actions()
+
+        self.backend: Optional[DRAMBackend] = None
+        self.seen_sigs: set = set()
+        self.first_error_time: Optional[int] = None
+
+    def num_actions(self) -> int:
+        return len(self.actions)
+
+    def reset(self, fault_seed: int, cfg_override: Optional[dict] = None):
+        cfg = FaultConfig(seed=fault_seed)
+        if cfg_override:
+            for k, v in cfg_override.items():
+                setattr(cfg, k, v)
+        fault = FaultModel(cfg, mem_words=self.mem_bytes // 4, phase=self.phase)
+        self.backend = DRAMBackend(self.mem_bytes, fault)
+        self.seen_sigs = set()
+        self.first_error_time = None
+
+    def step(self, action_id: int) -> StepResult:
+        assert self.backend is not None
+        t0 = self.backend.time
+        action = self.actions[action_id]
+
+        errs = sat_or_gen_fill_verify(self.backend, 0, self.region_bytes, action)
+
+        new_sigs = 0
+        ce = 0
+        ue = 0
+
+        for e in errs:
+            if e.is_ue:
+                ue += 1
+            else:
+                ce += 1
+
+            sig = signature_phase1(e) if self.phase == 1 else signature_phase2(e)
+            if sig not in self.seen_sigs:
+                self.seen_sigs.add(sig)
+                new_sigs += 1
+
+        if errs and self.first_error_time is None:
+            self.first_error_time = self.backend.time
+
+        return StepResult(
+            dt=self.backend.time - t0,
+            errors=len(errs),
+            new_sigs=new_sigs,
+            ce_count=ce,
+            ue_count=ue,
+            first_error_time=self.first_error_time
+        )
+
+
+# =========================
+# 5) Rewards (THIS is the key to your objective)
+# =========================
+
+def reward_phase1(res: StepResult, first_before: bool) -> float:
+    """
+    Phase-1 reward = induce CE quickly & consistently on known-CE devices.
+
+    - CE count is valuable (device already has CE: repeating CE is still success)
+    - NEW CE signatures is extra valuable (better coverage among CE sites)
+    - UE is NOT your phase-1 target (penalize it a bit)
+    - TTFF bonus (first CE/first error quickly)
+    - small time penalty
+    """
+    r = 0.0
+
+    # Primary: CE induction (repeatable)
+    if res.ce_count > 0:
+        r += 5.0 + 2.0 * res.ce_count
+
+    # Extra credit: discovering additional CE signatures (coverage)
+    r += 10.0 * res.new_sigs
+
+    # If it triggered the first error in episode: reward speed
+    if res.errors > 0 and first_before:
+        r += 25.0
+
+    # Penalize UE (not desired in phase1)
+    if res.ue_count > 0:
+        r -= 10.0 * res.ue_count
+
+    # Time penalty (prefer faster patterns if equal)
+    r -= 1e-5 * res.dt
+    return r
+
+def reward_phase2(res: StepResult, first_before: bool) -> float:
+    """
+    Phase-2 reward = discover NEW defects/signatures.
+
+    - New signature discovery dominates
+    - UE discovery can be given higher reward (optional)
+    - Repeating the same CE many times is not great (small reward)
+    - TTFF bonus still helps
+    """
+    r = 0.0
+
+    # Novelty dominates
+    r += 30.0 * res.new_sigs
+
+    # UE often indicates stronger/interesting issues; weight it higher
+    if res.ue_count > 0:
+        r += 50.0 + 5.0 * res.ue_count
+
+    # CE still counts, but less than novelty
+    if res.ce_count > 0:
+        r += 1.0 * res.ce_count
+
+    if res.errors > 0 and first_before:
+        r += 10.0
+
+    r -= 1e-5 * res.dt
+    return r
+
+
+# =========================
+# 6) Agent: Thompson-sampling bandit (works well for Phase-1, decent for Phase-2 bootstrapping)
+# =========================
+
+def train_bandit(phase: int, episodes: int, steps: int, mem_mb: int, region_kb: int,
+                 seed: int, out_path: str, cfg_override: dict):
+    rng = random.Random(seed)
+    env = SatEnv(mem_mb=mem_mb, region_kb=region_kb, phase=phase, seed=seed)
+
+    a = [1.0] * env.num_actions()
+    b = [1.0] * env.num_actions()
+
+    rew_fn = reward_phase1 if phase == 1 else reward_phase2
+
+    print(f"[train] phase={phase} actions={env.num_actions()} episodes={episodes} steps={steps}")
+
+    for ep in range(episodes):
+        env.reset(fault_seed=ep, cfg_override=cfg_override)
+        for _ in range(steps):
+            # sample theta for each action, pick best
+            best = 0
+            best_theta = -1.0
+            for i in range(env.num_actions()):
+                theta = rng.betavariate(a[i], b[i])
+                if theta > best_theta:
+                    best_theta = theta
+                    best = i
+
+            first_before = (env.first_error_time is None)
+            res = env.step(best)
+            rew = rew_fn(res, first_before)
+
+            # Bernoulli update from reward sign
+            if rew > 0:
+                a[best] += 1.0
+                # extra push when phase2 novelty happens, or phase1 CE happens
+                if phase == 1 and res.ce_count > 0:
+                    a[best] += 1.0
+                if phase == 2 and res.new_sigs > 0:
+                    a[best] += 2.0
+            else:
+                b[best] += 1.0
+
+    means = [a[i] / (a[i] + b[i]) for i in range(env.num_actions())]
+    ranked = sorted(range(env.num_actions()), key=lambda i: means[i], reverse=True)
+
+    policy = {
+        "phase": phase,
+        "type": "topk_cycle",
+        "topk": 20,
+        "actions": ranked[:20],
+        "posterior_mean_top50": {str(i): means[i] for i in ranked[:50]},
+        "mem_mb": mem_mb,
+        "region_kb": region_kb,
+        "episodes": episodes,
+        "steps": steps,
+        "cfg_override": cfg_override,
+    }
+
+    with open(out_path, "w") as f:
+        json.dump(policy, f, indent=2)
+
+    print(f"[train] wrote policy: {out_path}")
+    print("[train] top actions:")
+    for i in ranked[:10]:
+        print(f"  aid={i:4d} mean={means[i]:.3f}  {env.actions[i]['variant_name']}")
+
+
+# =========================
+# 7) Eval + Compare
+# =========================
+
+def run_eval(phase: int, episodes: int, steps: int, mem_mb: int, region_kb: int,
+             strategy: Callable[[int, int], int], cfg_override: dict) -> dict:
+    env = SatEnv(mem_mb=mem_mb, region_kb=region_kb, phase=phase, seed=0)
+
+    tot_ce = 0
+    tot_ue = 0
+    failures = 0
+    ttff_list: List[int] = []
+    global_cov: set = set()
+
+    for ep in range(episodes):
+        env.reset(fault_seed=ep + 10_000, cfg_override=cfg_override)  # eval seeds separate
+        for s in range(steps):
+            aid = strategy(s, env.num_actions())
+            res = env.step(aid)
+            tot_ce += res.ce_count
+            tot_ue += res.ue_count
+
+        if env.first_error_time is not None:
+            failures += 1
+            ttff_list.append(env.first_error_time)
+        global_cov |= env.seen_sigs
+
+    avg_ttff = sum(ttff_list) / len(ttff_list) if ttff_list else 0.0
+
+    return {
+        "phase": phase,
+        "ce": tot_ce,
+        "ue": tot_ue,
+        "failures": failures,
+        "avg_ttff": avg_ttff,
+        "coverage": len(global_cov)
+    }
+
+def print_compare(rows: List[dict]):
+    print("\n" + "=" * 100)
+    print(f"{'STRATEGY':<14} | {'FAIL(Ep)':<8} | {'COVERAGE':<10} | {'CE':<10} | {'UE':<10} | {'AVG_TTFF':<12}")
+    print("-" * 100)
+    for r in rows:
+        print(f"{r['name']:<14} | {r['failures']:<8} | {r['coverage']:<10} | {r['ce']:<10} | {r['ue']:<10} | {r['avg_ttff']:<12.1f}")
+    print("=" * 100 + "\n")
+
+
+# =========================
+# 8) CLI
+# =========================
+
+def parse_cfg(args) -> dict:
+    d = {}
+    # knobs you may want to override
+    if args.ce_site_prob is not None: d["ce_site_prob"] = args.ce_site_prob
+    if args.ce_flip_prob is not None: d["ce_flip_prob"] = args.ce_flip_prob
+
+    if args.burst_prob is not None: d["burst_prob"] = args.burst_prob
+    if args.retention_prob is not None: d["retention_prob"] = args.retention_prob
+    if args.hammer_threshold is not None: d["hammer_threshold"] = args.hammer_threshold
+    if args.hammer_flip_prob is not None: d["hammer_flip_prob"] = args.hammer_flip_prob
+    return d
+
+def main():
+    p = argparse.ArgumentParser()
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add_common(pp):
+        pp.add_argument("--phase", type=int, choices=[1,2], required=True)
+        pp.add_argument("--mem-mb", type=int, default=64)
+        pp.add_argument("--region-kb", type=int, default=64)
+        pp.add_argument("--episodes", type=int, default=200)
+        pp.add_argument("--steps", type=int, default=8)
+        pp.add_argument("--seed", type=int, default=0)
+
+        # fault overrides (optional)
+        pp.add_argument("--ce-site-prob", type=float, default=None)
+        pp.add_argument("--ce-flip-prob", type=float, default=None)
+
+        pp.add_argument("--burst-prob", type=float, default=None)
+        pp.add_argument("--retention-prob", type=float, default=None)
+        pp.add_argument("--hammer-threshold", type=int, default=None)
+        pp.add_argument("--hammer-flip-prob", type=float, default=None)
+
+    p_train = sub.add_parser("train")
+    add_common(p_train)
+    p_train.add_argument("--out", default="policy.json")
+
+    p_eval = sub.add_parser("eval")
+    add_common(p_eval)
+    p_eval.add_argument("--policy", required=True)
+
+    p_comp = sub.add_parser("compare")
+    add_common(p_comp)
+    p_comp.add_argument("--policy", required=True)
+
+    args = p.parse_args()
+    cfg = parse_cfg(args)
+
+    if args.cmd == "train":
+        train_bandit(args.phase, args.episodes, args.steps, args.mem_mb, args.region_kb,
+                     args.seed, args.out, cfg)
+
+    elif args.cmd == "eval":
+        with open(args.policy, "r") as f:
+            pol = json.load(f)
+        actions = pol["actions"]
+
+        def strat(step: int, n: int) -> int:
+            return int(actions[step % len(actions)])
+
+        r = run_eval(args.phase, args.episodes, args.steps, args.mem_mb, args.region_kb, strat, cfg)
+        print(f"[eval] phase={args.phase} CE={r['ce']} UE={r['ue']} coverage={r['coverage']} failures={r['failures']} avg_TTFF={r['avg_ttff']:.1f}")
+
+    elif args.cmd == "compare":
+        with open(args.policy, "r") as f:
+            pol = json.load(f)
+        pol_actions = pol["actions"]
+
+        rng = random.Random(123)
+
+        def seq(step: int, n: int) -> int:
+            return step % n
+
+        def rnd(step: int, n: int) -> int:
+            return rng.randrange(n)
+
+        def rl(step: int, n: int) -> int:
+            return int(pol_actions[step % len(pol_actions)])
+
+        rows = []
+        for name, st in [("Sequential", seq), ("Random", rnd), ("RL", rl)]:
+            rr = run_eval(args.phase, args.episodes, args.steps, args.mem_mb, args.region_kb, st, cfg)
+            rr["name"] = name
+            rows.append(rr)
+        print_compare(rows)
+
+if __name__ == "__main__":
+    main()
+
 
 #!/usr/bin/env python3
 # gsat_fault_rl_allinone.py
