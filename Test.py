@@ -220,6 +220,1232 @@ def top_k_by_weight(vars_: List[PatternVariant], k: int) -> List[PatternVariant]
 # ============================================================
 
 class RamulatorProc:
+    """
+    Auto-detects your interactive driver protocol.
+
+    Supported protocols:
+      DATA:
+        W <addr_hex> <data_hex> <ctx> <max_cycles>
+        R <addr_hex> <ctx> <max_cycles>
+        -> DONE <cycles> [DATA 0x...]
+      A:
+        REQWAIT <addr_hex> <is_write 0/1> <ctx>
+        -> OK <lat>  OR STALLED
+      B:
+        REQ <R|W> <addr_hex> <ctx> <max_cycles>
+        -> DONE <cycles> OR STALLED OR TIMEOUT <cycles>
+      C (simple Gemini-style driver):
+        REQ <addr_dec> <type_int>    # 0=read, 1=write
+        TICK
+        -> ACCEPTED / STALLED, and TICK -> OK
+        (no latency numbers)
+    """
+    def __init__(self, exe: str, config: str, max_cycles: int = 200000, ticks_per_req: int = 1):
+        self.exe = exe
+        self.config = config
+        self.max_cycles = max_cycles
+        self.ticks_per_req = max(0, int(ticks_per_req))
+        self.proc = None
+        self.proto = None  # "DATA" | "A" | "B" | "C"
+
+    def start(self):
+        self.proc = subprocess.Popen(
+            [self.exe, self.config],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            text=True,
+            bufsize=1,
+        )
+        first = self.proc.stdout.readline().strip()
+        if first != "READY":
+            raise RuntimeError(f"Driver not READY. Got: {first}")
+
+        # Try DATA protocol (preferred)
+        resp = self._cmd(f"W 0x100000 0x0 0 {self.max_cycles}")
+        if resp.startswith(("DONE", "TIMEOUT")) or resp == "STALLED":
+            self.proto = "DATA"
+            return
+
+        # Try REQWAIT
+        resp = self._cmd("REQWAIT 0x100000 0 0")
+        if resp.startswith("OK") or resp == "STALLED":
+            self.proto = "A"
+            return
+
+        # Try REQ (R/W token)
+        resp = self._cmd(f"REQ R 0x100000 0 {self.max_cycles}")
+        if resp.startswith(("DONE", "TIMEOUT")) or resp == "STALLED":
+            self.proto = "B"
+            return
+
+        # Try protocol C: TICK then REQ <addr_dec> <type_int>
+        tick = self._cmd("TICK")
+        if tick == "OK":
+            resp2 = self._cmd("REQ 1048576 0")
+            if resp2 in ("ACCEPTED", "STALLED"):
+                self.proto = "C"
+                return
+
+        raise RuntimeError(f"Unknown driver protocol. Response: {resp}")
+
+    def _cmd(self, line: str) -> str:
+        self.proc.stdin.write(line + "\n")
+        self.proc.stdin.flush()
+        return self.proc.stdout.readline().strip()
+
+    @staticmethod
+    def _first_int(s: str) -> Optional[int]:
+        m = re.search(r"(-?\d+)", s)
+        return int(m.group(1)) if m else None
+
+    def tick(self, n: int = 1) -> None:
+        if not self.proc or self.proto != "C":
+            return
+        for _ in range(max(0, n)):
+            _ = self._cmd("TICK")
+
+    def req_legacy(self, addr: int, is_write: bool, ctx: int = 0) -> Tuple[bool, Optional[int], str]:
+        addr_hex = hex(addr)
+
+        if self.proto == "C":
+            resp = self._cmd(f"REQ {int(addr)} {1 if is_write else 0}")
+            if resp == "STALLED":
+                return False, None, resp
+            if resp == "ACCEPTED":
+                self.tick(self.ticks_per_req)
+                return True, None, resp
+            return False, None, resp
+
+        if self.proto == "A":
+            resp = self._cmd(f"REQWAIT {addr_hex} {1 if is_write else 0} {ctx}")
+            if resp == "STALLED":
+                return False, None, resp
+            if resp.startswith("OK"):
+                lat = self._first_int(resp)
+                return True, lat, resp
+            return False, None, resp
+
+        # proto B
+        rw = "W" if is_write else "R"
+        resp = self._cmd(f"REQ {rw} {addr_hex} {ctx} {self.max_cycles}")
+        if resp == "STALLED":
+            return False, None, resp
+        if resp.startswith(("DONE", "TIMEOUT")):
+            lat = self._first_int(resp)
+            return True, lat, resp
+        return False, None, resp
+
+    def write_data(self, addr: int, data32: int, ctx: int = 0) -> Tuple[bool, Optional[int], str]:
+        if self.proto != "DATA":
+            return self.req_legacy(addr, True, ctx)
+        resp = self._cmd(f"W {hex(addr)} {hex(data32 & MASK32)} {ctx} {self.max_cycles}")
+        if resp == "STALLED":
+            return False, None, resp
+        lat = self._first_int(resp)
+        return True, lat, resp
+
+    def read_data(self, addr: int, ctx: int = 0) -> Tuple[bool, Optional[int], Optional[int], str]:
+        if self.proto != "DATA":
+            ok, lat, resp = self.req_legacy(addr, False, ctx)
+            return ok, lat, None, resp
+
+        resp = self._cmd(f"R {hex(addr)} {ctx} {self.max_cycles}")
+        if resp == "STALLED":
+            return False, None, None, resp
+        lat = self._first_int(resp)
+        data = None
+        m = re.search(r"DATA\s+(0x[0-9a-fA-F]+)", resp)
+        if m:
+            data = int(m.group(1), 16) & MASK32
+        return True, lat, data, resp
+
+    def close(self):
+        if not self.proc:
+            return
+        try:
+            self.proc.stdin.write("EXIT\n")
+            self.proc.stdin.flush()
+        except Exception:
+            pass
+        try:
+            self.proc.terminate()
+        except Exception:
+            pass
+        self.proc = None
+
+
+# ============================================================
+# C) Realistic software fault model
+# ============================================================
+
+@dataclass
+class FaultConfig:
+    p_sf: float = 1e-6
+    p_cf: float = 5e-6
+    p_rdf: float = 2e-6
+    p_drdf: float = 2e-6
+    p_wdf: float = 2e-6
+    p_tcf: float = 5e-6
+    p_scf: float = 3e-6
+    p_dccf: float = 3e-6
+    p_irf: float = 2e-6
+    p_icf: float = 2e-6
+    p_ret: float = 2e-6
+
+    p_ue_given_fault: float = 0.15
+
+    hammer_thresh: int = 20000
+    rdf_thresh: int = 8000
+    wdf_thresh: int = 8000
+    retention_age: int = 50000
+
+    temp_start: float = 40.0
+    temp_drift_per_step: float = 0.0002
+    temp_noise: float = 0.05
+    temp_scale: float = 0.02
+
+    bank_shift: int = 14
+    bank_mask: int = 0xF
+    row_shift: int = 18
+    row_mask: int = 0xFFFF
+    col_shift: int = 6
+    col_mask: int = 0xFF
+
+    row_neighbor: int = 1
+
+@dataclass
+class FaultEvent:
+    kind: str
+    severity: str      # "CE" or "UE"
+    addr: int
+    flipped_mask: int
+    info: str = ""
+
+class FaultModel:
+    def __init__(self, cfg: FaultConfig, seed: int = 1):
+        self.cfg = cfg
+        self.rng = random.Random(seed)
+
+        self.shadow: Dict[int, int] = {}
+        self.stuck_mask: Dict[int, int] = {}
+        self.stuck_value: Dict[int, int] = {}
+
+        self.read_count: Dict[int, int] = {}
+        self.write_count: Dict[int, int] = {}
+        self.row_hammer: Dict[int, int] = {}
+        self.last_touch_time: Dict[int, int] = {}
+        self.time: int = 0
+
+        self.irf_until: Dict[int, int] = {}
+        self.icf_until: Dict[int, int] = {}
+
+        self.temp: float = cfg.temp_start
+
+    def _rand(self) -> float:
+        return self.rng.random()
+
+    def _pick_bits(self, kmin: int, kmax: int) -> int:
+        k = self.rng.randint(kmin, kmax)
+        mask = 0
+        for _ in range(k):
+            b = self.rng.randrange(32)
+            mask ^= (1 << b)
+        return mask & MASK32
+
+    def _severity(self) -> str:
+        return "UE" if self._rand() < self.cfg.p_ue_given_fault else "CE"
+
+    def _row_id(self, addr: int) -> int:
+        bank = (addr >> self.cfg.bank_shift) & self.cfg.bank_mask
+        row = (addr >> self.cfg.row_shift) & self.cfg.row_mask
+        return (bank << 16) | row
+
+    def _col_id(self, addr: int) -> int:
+        return (addr >> self.cfg.col_shift) & self.cfg.col_mask
+
+    def _neighbors(self, addr: int) -> List[int]:
+        rid = self._row_id(addr)
+        bank = rid >> 16
+        row = rid & 0xFFFF
+        col = self._col_id(addr)
+
+        nbrs: List[int] = []
+
+        for dr in (-self.cfg.row_neighbor, self.cfg.row_neighbor):
+            nrow = (row + dr) & 0xFFFF
+            base = addr & ((1 << self.cfg.row_shift) - 1)
+            naddr = base | ((bank & 0xF) << self.cfg.bank_shift) | (nrow << self.cfg.row_shift) | (col << self.cfg.col_shift)
+            nbrs.append(naddr)
+
+        for dc in (-1, 1):
+            ncol = (col + dc) & self.cfg.col_mask
+            base = addr & ~(((self.cfg.col_mask) << self.cfg.col_shift))
+            naddr = base | (ncol << self.cfg.col_shift)
+            nbrs.append(naddr)
+
+        return nbrs
+
+    def _temp_scale(self) -> float:
+        dt = max(0.0, self.temp - 40.0)
+        return 1.0 + dt * self.cfg.temp_scale
+
+    def tick(self, steps: int = 1) -> None:
+        for _ in range(steps):
+            self.time += 1
+            self.temp += self.cfg.temp_drift_per_step
+            self.temp += (self.rng.random() - 0.5) * 2.0 * self.cfg.temp_noise
+
+    def write(self, addr: int, data32: int, pattern_label: str) -> List[FaultEvent]:
+        self.tick()
+        events: List[FaultEvent] = []
+        data32 &= MASK32
+
+        # SF injection at first touch
+        if addr not in self.stuck_mask and self._rand() < self.cfg.p_sf * self._temp_scale():
+            sm = self._pick_bits(1, 4)
+            sv = self.rng.getrandbits(32) & sm
+            self.stuck_mask[addr] = sm
+            self.stuck_value[addr] = sv
+            events.append(FaultEvent("SF", self._severity(), addr, sm, "installed"))
+
+        # store write
+        self.shadow[addr] = data32
+        self.write_count[addr] = self.write_count.get(addr, 0) + 1
+        self.last_touch_time[addr] = self.time
+
+        rid = self._row_id(addr)
+        self.row_hammer[rid] = self.row_hammer.get(rid, 0) + 1
+
+        # WDF (write upset)
+        wc = self.write_count[addr]
+        if wc > self.cfg.wdf_thresh and self._rand() < self.cfg.p_wdf * self._temp_scale():
+            sev = self._severity()
+            mask = self._pick_bits(1, 2) if sev == "CE" else self._pick_bits(2, 8)
+            self.shadow[addr] ^= mask
+            events.append(FaultEvent("WDF", sev, addr, mask, f"wc={wc}"))
+
+        # DCCF boost: higher switching activity in word
+        trans = (data32 ^ ((data32 << 1) & MASK32)).bit_count()
+        dccf_boost = 1.0 + (trans / 32.0)
+
+        # intermittent coupling window
+        if rid not in self.icf_until and self._rand() < self.cfg.p_icf * 0.1:
+            self.icf_until[rid] = self.time + self.rng.randint(100, 2000)
+        icf_active = (rid in self.icf_until and self.time <= self.icf_until[rid])
+
+        base_p = self.cfg.p_cf * self._temp_scale()
+        scf_p = self.cfg.p_scf * self._temp_scale()
+        dccf_p = self.cfg.p_dccf * self._temp_scale() * dccf_boost
+        icf_p = self.cfg.p_icf * self._temp_scale() * (3.0 if icf_active else 1.0)
+
+        for naddr in self._neighbors(addr):
+            r = self._rand()
+            kind = None
+            p_total = base_p + scf_p + dccf_p + icf_p
+            if r < base_p:
+                kind = "CF"
+            elif r < base_p + scf_p:
+                kind = "SCF"
+            elif r < base_p + scf_p + dccf_p:
+                kind = "DCCF"
+            elif r < p_total:
+                kind = "ICF"
+
+            if kind:
+                sev = self._severity()
+                mask = self._pick_bits(1, 2) if sev == "CE" else self._pick_bits(2, 10)
+                self.shadow[naddr] = (self.shadow.get(naddr, 0) ^ mask) & MASK32
+                events.append(FaultEvent(kind, sev, naddr, mask, f"from={hex(addr)} label={pattern_label}"))
+
+        # HAMMER
+        if self.row_hammer[rid] > self.cfg.hammer_thresh:
+            self.row_hammer[rid] = 0
+            for vaddr in self._neighbors(addr):
+                sev = "UE" if self._rand() < 0.25 else "CE"
+                mask = self._pick_bits(1, 3) if sev == "CE" else self._pick_bits(4, 12)
+                self.shadow[vaddr] = (self.shadow.get(vaddr, 0) ^ mask) & MASK32
+                events.append(FaultEvent("HAMMER", sev, vaddr, mask, f"aggr_row={rid}"))
+
+        return events
+
+    def read(self, addr: int, expected: int, pattern_label: str) -> Tuple[int, List[FaultEvent]]:
+        self.tick()
+        events: List[FaultEvent] = []
+        val = self.shadow.get(addr, 0) & MASK32
+
+        # RETENTION
+        age = self.time - self.last_touch_time.get(addr, self.time)
+        if age > self.cfg.retention_age:
+            p = self.cfg.p_ret * self._temp_scale() * (1.0 + (age - self.cfg.retention_age) / max(1, self.cfg.retention_age))
+            if self._rand() < min(0.2, p):
+                sev = self._severity()
+                mask = self._pick_bits(1, 2) if sev == "CE" else self._pick_bits(2, 12)
+                val ^= mask
+                events.append(FaultEvent("RET", sev, addr, mask, f"age={age}"))
+
+        # apply SF on read
+        if addr in self.stuck_mask:
+            sm = self.stuck_mask[addr]
+            sv = self.stuck_value[addr]
+            before = val
+            val = (val & ~sm) | (sv & sm)
+            if val != before:
+                mask = (before ^ val) & MASK32
+                sev = "CE" if mask.bit_count() == 1 else "UE"
+                events.append(FaultEvent("SF", sev, addr, mask, "applied"))
+
+        # RDF
+        rc = self.read_count.get(addr, 0) + 1
+        self.read_count[addr] = rc
+        if rc > self.cfg.rdf_thresh and self._rand() < self.cfg.p_rdf * self._temp_scale():
+            sev = self._severity()
+            mask = self._pick_bits(1, 1) if sev == "CE" else self._pick_bits(2, 8)
+            val ^= mask
+            events.append(FaultEvent("RDF", sev, addr, mask, f"rc={rc}"))
+
+        # DRDF (activity dependent)
+        wc = self.write_count.get(addr, 0)
+        if wc > 0 and self._rand() < self.cfg.p_drdf * self._temp_scale() * (1.0 + min(3.0, wc / 5000.0)):
+            sev = self._severity()
+            mask = self._pick_bits(1, 2) if sev == "CE" else self._pick_bits(2, 10)
+            val ^= mask
+            events.append(FaultEvent("DRDF", sev, addr, mask, f"wc={wc}"))
+
+        # IRF intermittent window
+        if addr not in self.irf_until and self._rand() < self.cfg.p_irf * 0.1:
+            self.irf_until[addr] = self.time + self.rng.randint(50, 1000)
+        if addr in self.irf_until and self.time <= self.irf_until[addr]:
+            if self._rand() < self.cfg.p_irf * 5.0:
+                sev = self._severity()
+                mask = self._pick_bits(1, 1) if sev == "CE" else self._pick_bits(2, 6)
+                val ^= mask
+                events.append(FaultEvent("IRF", sev, addr, mask, "window"))
+
+        # TCF temp effect
+        if self._rand() < self.cfg.p_tcf * max(0.0, (self.temp - 45.0)) * 0.05:
+            sev = self._severity()
+            mask = self._pick_bits(1, 2) if sev == "CE" else self._pick_bits(2, 8)
+            val ^= mask
+            events.append(FaultEvent("TCF", sev, addr, mask, f"temp={self.temp:.1f}"))
+
+        # If mismatch but no labeled event, create MISMATCH
+        if val != (expected & MASK32) and not events:
+            mask = (val ^ expected) & MASK32
+            sev = "CE" if mask.bit_count() == 1 else "UE"
+            events.append(FaultEvent("MISMATCH", sev, addr, mask, f"label={pattern_label}"))
+
+        return val & MASK32, events
+
+
+# ============================================================
+# D) Metrics
+# ============================================================
+
+def latency_tail(latencies: List[int]) -> Dict[str, Optional[float]]:
+    if not latencies:
+        return {"p50": None, "p95": None, "p99": None, "mean": None}
+    s = sorted(latencies)
+    def pct(p):
+        idx = int(round((p / 100.0) * (len(s) - 1)))
+        return float(s[max(0, min(len(s)-1, idx))])
+    return {
+        "p50": pct(50),
+        "p95": pct(95),
+        "p99": pct(99),
+        "mean": float(sum(s) / len(s)),
+    }
+
+def region_bytes(n_addrs: int, stride: int) -> int:
+    return int(n_addrs) * int(stride)
+
+def fault_stats(faults: List[FaultEvent]) -> Dict[str, Any]:
+    ce = sum(1 for f in faults if f.severity == "CE")
+    ue = sum(1 for f in faults if f.severity == "UE")
+    kinds: Dict[str, int] = {}
+    for f in faults:
+        kinds[f.kind] = kinds.get(f.kind, 0) + 1
+    return {"ce": ce, "ue": ue, "kinds": kinds, "unique_kinds": len(kinds)}
+
+# ============================================================
+# E) Stress step
+# ============================================================
+
+def choose_addr(addr_base: int, stride: int, n_addrs: int, label: str, step: int, mode: str, rng: random.Random) -> int:
+    if n_addrs <= 0:
+        return addr_base
+    if mode == "random":
+        idx = rng.randrange(n_addrs)
+    elif mode == "sequential":
+        idx = step % n_addrs
+    else:
+        h = sum(ord(c) for c in label) & 0xFFFFFFFF
+        idx = (h + step) % n_addrs
+    return addr_base + idx * stride
+
+@dataclass
+class StepResult:
+    latency: Optional[int]
+    faults: List[FaultEvent]
+    raw: str
+    addr_touched: int
+
+def one_step(ram: RamulatorProc,
+             fm: FaultModel,
+             v: PatternVariant,
+             addr_base: int,
+             stride: int,
+             n_addrs: int,
+             ctx: int,
+             spike_thresh: int,
+             burst_len: int,
+             addr_mode: str,
+             step_idx: int,
+             rng: random.Random) -> StepResult:
+
+    total_lat = 0
+    lat_valid = True
+    all_faults: List[FaultEvent] = []
+    raw_last = ""
+    addr_last = addr_base
+
+    for b in range(burst_len):
+        addr = choose_addr(addr_base, stride, n_addrs, v.label, step_idx * burst_len + b, addr_mode, rng)
+        addr_last = addr
+
+        data = v.word(step_idx * burst_len + b)
+        expected = data
+
+        ok_w, lat_w, raw_w = ram.write_data(addr, data, ctx)
+        raw_last = raw_w
+        if not ok_w:
+            all_faults.append(FaultEvent("STALLED", "UE", addr, 0, "driver stalled on write"))
+            lat_valid = False
+            continue
+        if lat_w is not None:
+            total_lat += lat_w
+
+        all_faults.extend(fm.write(addr, data, v.label))
+
+        ok_r, lat_r, _data_from_driver, raw_r = ram.read_data(addr, ctx)
+        raw_last = raw_r
+        if not ok_r:
+            all_faults.append(FaultEvent("STALLED", "UE", addr, 0, "driver stalled on read"))
+            lat_valid = False
+            continue
+        if lat_r is not None:
+            total_lat += lat_r
+
+        _val, read_faults = fm.read(addr, expected, v.label)
+        all_faults.extend(read_faults)
+
+    lat = total_lat if lat_valid else None
+    if lat is not None and lat >= spike_thresh:
+        all_faults.append(FaultEvent("LAT_SPIKE", "CE", addr_last, 0, f"lat={lat} >= {spike_thresh}"))
+
+    return StepResult(latency=lat, faults=all_faults, raw=raw_last, addr_touched=addr_last)
+
+# ============================================================
+# F) Baseline vs RL
+# ============================================================
+
+def make_action_set(kind: str) -> List[PatternVariant]:
+    vars_ = all_variants(include_zero_weight=False)
+    if kind == "all":
+        return vars_
+    if kind == "top64":
+        return top_k_by_weight(vars_, 64)
+    raise ValueError("action_set must be 'top64' or 'all'")
+
+def run_baseline(exe: str, config: str, action_set: List[PatternVariant],
+                 steps_per_action: int,
+                 addr_base: int, stride: int, n_addrs: int,
+                 ctx: int, spike_thresh: int,
+                 burst_len: int, addr_mode: str,
+                 fault_seed: int,
+                 ticks_per_req: int = 1) -> Dict[str, Any]:
+
+    ram = RamulatorProc(exe, config, max_cycles=max_cycles, ticks_per_req=ticks_per_req)
+    ram.start()
+    fm = FaultModel(FaultConfig(), seed=fault_seed)
+    rng = random.Random(fault_seed + 999)
+
+    start = time.time()
+    total_steps = 0
+    latencies: List[int] = []
+    cov_patterns: Set[str] = set()
+    cov_addrs: Set[int] = set()
+
+    faults_all: List[FaultEvent] = []
+
+    ttff_ce = None
+    ttff_ue = None
+    ttff_ce_step = None
+    ttff_ue_step = None
+    ttff_ce_action = None
+    ttff_ue_action = None
+
+    for v in action_set:
+        for _ in range(steps_per_action):
+            res = one_step(
+                ram, fm, v,
+                addr_base, stride, n_addrs,
+                ctx, spike_thresh,
+                burst_len, addr_mode,
+                step_idx=total_steps,
+                rng=rng
+            )
+            total_steps += 1
+            cov_patterns.add(v.label)
+            cov_addrs.add(res.addr_touched)
+
+            if res.latency is not None:
+                latencies.append(res.latency)
+
+            if res.faults:
+                faults_all.extend(res.faults)
+                if ttff_ce is None and any(f.severity == "CE" for f in res.faults):
+                    ttff_ce = time.time() - start
+                    ttff_ce_step = total_steps
+                    ttff_ce_action = v.label
+                if ttff_ue is None and any(f.severity == "UE" for f in res.faults):
+                    ttff_ue = time.time() - start
+                    ttff_ue_step = total_steps
+                    ttff_ue_action = v.label
+
+    elapsed = time.time() - start
+    ram.close()
+
+    fs = fault_stats(faults_all)
+    return {
+        "mode": "baseline",
+        "elapsed_s": elapsed,
+        "actions": len(action_set),
+        "steps_per_action": steps_per_action,
+        "total_steps": total_steps,
+        "burst_len": burst_len,
+        "addr_mode": addr_mode,
+        "region_bytes": region_bytes(n_addrs, stride),
+        "coverage_patterns": len(cov_patterns),
+        "coverage_addrs": len(cov_addrs),
+        "faults": fs,
+        "faults_per_min": (len(faults_all) / (elapsed / 60.0)) if elapsed > 0 else None,
+        "ttff_ce_s": ttff_ce,
+        "ttff_ue_s": ttff_ue,
+        "ttff_ce_step": ttff_ce_step,
+        "ttff_ue_step": ttff_ue_step,
+        "ttff_ce_action": ttff_ce_action,
+        "ttff_ue_action": ttff_ue_action,
+        "latency_tail": latency_tail(latencies),
+    }
+
+def train_bandit(exe: str, config: str, action_set: List[PatternVariant],
+                 episodes: int, steps_per_ep: int,
+                 epsilon: float, alpha: float,
+                 addr_base: int, stride: int, n_addrs: int,
+                 ctx: int, spike_thresh: int,
+                 burst_len: int, addr_mode: str,
+                 fault_seed: int,
+                 reward_ue: float = 200.0, reward_ce: float = 50.0, reward_spike: float = 5.0,
+                 ticks_per_req: int = 1) -> Dict[str, Any]:
+
+    ram = RamulatorProc(exe, config, max_cycles=max_cycles, ticks_per_req=ticks_per_req)
+    ram.start()
+    fm = FaultModel(FaultConfig(), seed=fault_seed)
+    rng = random.Random(fault_seed + 1234)
+
+    K = len(action_set)
+    Q = [0.0] * K
+    pulls = [0] * K
+
+    start = time.time()
+    total_steps = 0
+    latencies: List[int] = []
+    cov_patterns: Set[str] = set()
+    cov_addrs: Set[int] = set()
+    faults_all: List[FaultEvent] = []
+
+    ttff_ce = None
+    ttff_ue = None
+    ttff_ce_step = None
+    ttff_ue_step = None
+    ttff_ce_action = None
+    ttff_ue_action = None
+
+    def reward(res: StepResult) -> float:
+        r = 0.0
+        if any(f.severity == "UE" for f in res.faults):
+            r += reward_ue
+        if any(f.severity == "CE" for f in res.faults):
+            r += reward_ce
+        if res.latency is not None and res.latency >= spike_thresh:
+            r += reward_spike
+        r += 0.5 * len(res.faults)
+        return r
+
+    for ep in range(episodes):
+        for _ in range(steps_per_ep):
+            if rng.random() < epsilon:
+                a = rng.randrange(K)
+            else:
+                a = max(range(K), key=lambda i: Q[i])
+
+            v = action_set[a]
+            cov_patterns.add(v.label)
+
+            res = one_step(
+                ram, fm, v,
+                addr_base, stride, n_addrs,
+                ctx, spike_thresh,
+                burst_len, addr_mode,
+                step_idx=total_steps,
+                rng=rng
+            )
+
+            total_steps += 1
+            cov_addrs.add(res.addr_touched)
+
+            if res.latency is not None:
+                latencies.append(res.latency)
+
+            if res.faults:
+                faults_all.extend(res.faults)
+                if ttff_ce is None and any(f.severity == "CE" for f in res.faults):
+                    ttff_ce = time.time() - start
+                    ttff_ce_step = total_steps
+                    ttff_ce_action = v.label
+                if ttff_ue is None and any(f.severity == "UE" for f in res.faults):
+                    ttff_ue = time.time() - start
+                    ttff_ue_step = total_steps
+                    ttff_ue_action = v.label
+
+            r = reward(res)
+            pulls[a] += 1
+            Q[a] = Q[a] + alpha * (r - Q[a])
+
+        if (ep + 1) in {max(1, episodes // 4), max(1, episodes // 2), max(1, (3 * episodes) // 4), episodes}:
+            best = max(range(K), key=lambda i: Q[i])
+            print(f"[train] ep={ep+1}/{episodes} best={action_set[best].label} Q={Q[best]:.2f} faults={len(faults_all)}")
+
+    elapsed = time.time() - start
+    best = max(range(K), key=lambda i: Q[i])
+
+    ram.close()
+    fs = fault_stats(faults_all)
+
+    return {
+        "mode": "train",
+        "elapsed_s": elapsed,
+        "episodes": episodes,
+        "steps_per_ep": steps_per_ep,
+        "total_steps": total_steps,
+        "burst_len": burst_len,
+        "addr_mode": addr_mode,
+        "region_bytes": region_bytes(n_addrs, stride),
+        "coverage_patterns": len(cov_patterns),
+        "coverage_addrs": len(cov_addrs),
+        "faults": fs,
+        "faults_per_min": (len(faults_all) / (elapsed / 60.0)) if elapsed > 0 else None,
+        "ttff_ce_s": ttff_ce,
+        "ttff_ue_s": ttff_ue,
+        "ttff_ce_step": ttff_ce_step,
+        "ttff_ue_step": ttff_ue_step,
+        "ttff_ce_action": ttff_ce_action,
+        "ttff_ue_action": ttff_ue_action,
+        "latency_tail": latency_tail(latencies),
+        "best_action": action_set[best].label,
+        "best_index": best,
+        "Q": Q,
+        "pulls": pulls,
+        "action_labels": [v.label for v in action_set],
+        "reward_params": {
+            "reward_ue": reward_ue,
+            "reward_ce": reward_ce,
+            "reward_spike": reward_spike,
+            "alpha": alpha,
+            "epsilon": epsilon,
+        },
+    }
+
+def eval_best(exe: str, config: str, action_set: List[PatternVariant],
+              best_action_label: str,
+              eval_steps: int,
+              addr_base: int, stride: int, n_addrs: int,
+              ctx: int, spike_thresh: int,
+              burst_len: int, addr_mode: str,
+              fault_seed: int,
+                 ticks_per_req: int = 1) -> Dict[str, Any]:
+
+    label_to_idx = {v.label: i for i, v in enumerate(action_set)}
+    if best_action_label not in label_to_idx:
+        raise ValueError(f"best_action_label '{best_action_label}' not found in current action_set")
+    best_v = action_set[label_to_idx[best_action_label]]
+
+    ram = RamulatorProc(exe, config, max_cycles=max_cycles, ticks_per_req=ticks_per_req)
+    ram.start()
+    fm = FaultModel(FaultConfig(), seed=fault_seed)
+    rng = random.Random(fault_seed + 555)
+
+    start = time.time()
+    latencies: List[int] = []
+    cov_addrs: Set[int] = set()
+    faults_all: List[FaultEvent] = []
+
+    ttff_ce = None
+    ttff_ue = None
+    ttff_ce_step = None
+    ttff_ue_step = None
+
+    for step in range(1, eval_steps + 1):
+        res = one_step(
+            ram, fm, best_v,
+            addr_base, stride, n_addrs,
+            ctx, spike_thresh,
+            burst_len, addr_mode,
+            step_idx=step,
+            rng=rng
+        )
+        cov_addrs.add(res.addr_touched)
+        if res.latency is not None:
+            latencies.append(res.latency)
+        if res.faults:
+            faults_all.extend(res.faults)
+            if ttff_ce is None and any(f.severity == "CE" for f in res.faults):
+                ttff_ce = time.time() - start
+                ttff_ce_step = step
+            if ttff_ue is None and any(f.severity == "UE" for f in res.faults):
+                ttff_ue = time.time() - start
+                ttff_ue_step = step
+
+    elapsed = time.time() - start
+    ram.close()
+    fs = fault_stats(faults_all)
+
+    return {
+        "mode": "eval",
+        "best_action": best_v.label,
+        "elapsed_s": elapsed,
+        "eval_steps": eval_steps,
+        "burst_len": burst_len,
+        "addr_mode": addr_mode,
+        "region_bytes": region_bytes(n_addrs, stride),
+        "coverage_addrs": len(cov_addrs),
+        "faults": fs,
+        "faults_per_min": (len(faults_all) / (elapsed / 60.0)) if elapsed > 0 else None,
+        "ttff_ce_s": ttff_ce,
+        "ttff_ue_s": ttff_ue,
+        "ttff_ce_step": ttff_ce_step,
+        "ttff_ue_step": ttff_ue_step,
+        "latency_tail": latency_tail(latencies),
+    }
+
+# ============================================================
+# G) CLI
+# ============================================================
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="GSAT baseline vs RL with realistic fault injection")
+    ap.add_argument("--exe", required=True, help="Path to interactive driver executable (prints READY)")
+    ap.add_argument("--config", required=True, help="Path to YAML config file")
+    ap.add_argument("--action_set", "--action-set", dest="action_set", default="top64", choices=["top64", "all"])
+
+    ap.add_argument("--addr_base", "--addr-base", dest="addr_base", type=lambda x: int(x, 0), default=0x100000)
+    ap.add_argument("--stride", type=int, default=64)
+    ap.add_argument("--n_addrs", "--n-addrs", dest="n_addrs", type=int, default=1024)
+
+    ap.add_argument("--ctx", type=int, default=0)
+    ap.add_argument("--spike_thresh", "--spike-thresh", dest="spike_thresh", type=int, default=4000)
+
+    ap.add_argument("--burst_len", "--burst-len", dest="burst_len", type=int, default=1)
+    ap.add_argument("--addr_mode", "--addr-mode", dest="addr_mode", default="hash", choices=["hash", "sequential", "random"])
+
+    ap.add_argument("--fault_seed", "--fault-seed", dest="fault_seed", type=int, default=1)
+
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    b = sub.add_parser("baseline")
+    b.add_argument("--steps_per_action", "--steps-per-action", dest="steps_per_action", type=int, default=200)
+
+    t = sub.add_parser("train")
+    t.add_argument("--episodes", type=int, default=200)
+    t.add_argument("--steps_per_ep", "--steps-per-ep", dest="steps_per_ep", type=int, default=50)
+    t.add_argument("--epsilon", type=float, default=0.2)
+    t.add_argument("--alpha", type=float, default=0.1)
+    t.add_argument("--out", default="rl_model.json")
+
+    e = sub.add_parser("eval")
+    e.add_argument("--model", required=True)
+    e.add_argument("--eval_steps", "--eval-steps", dest="eval_steps", type=int, default=2000)
+
+    c = sub.add_parser("compare")
+    c.add_argument("--steps_per_action", "--steps-per-action", dest="steps_per_action", type=int, default=200)
+    c.add_argument("--episodes", type=int, default=200)
+    c.add_argument("--steps_per_ep", "--steps-per-ep", dest="steps_per_ep", type=int, default=50)
+    c.add_argument("--epsilon", type=float, default=0.2)
+    c.add_argument("--alpha", type=float, default=0.1)
+    c.add_argument("--eval_steps", "--eval-steps", dest="eval_steps", type=int, default=2000)
+    c.add_argument("--out", default="compare_report.json")
+
+    args = ap.parse_args()
+    action_set = make_action_set(args.action_set)
+
+    if args.cmd == "baseline":
+        rep = run_baseline(
+            exe=args.exe, config=args.config, action_set=action_set,
+            steps_per_action=args.steps_per_action,
+            addr_base=args.addr_base, stride=args.stride, n_addrs=args.n_addrs,
+            ctx=args.ctx, spike_thresh=args.spike_thresh,
+            burst_len=args.burst_len, addr_mode=args.addr_mode,
+            fault_seed=args.fault_seed
+        )
+        print(json.dumps(rep, indent=2))
+        return
+
+    if args.cmd == "train":
+        rep = train_bandit(
+            exe=args.exe, config=args.config, action_set=action_set,
+            episodes=args.episodes, steps_per_ep=args.steps_per_ep,
+            epsilon=args.epsilon, alpha=args.alpha,
+            addr_base=args.addr_base, stride=args.stride, n_addrs=args.n_addrs,
+            ctx=args.ctx, spike_thresh=args.spike_thresh,
+            burst_len=args.burst_len, addr_mode=args.addr_mode,
+            fault_seed=args.fault_seed
+        )
+        out = {
+            "meta": {
+                "exe": args.exe,
+                "config": args.config,
+                "action_set": args.action_set,
+                "addr_base": args.addr_base,
+                "stride": args.stride,
+                "n_addrs": args.n_addrs,
+                "ctx": args.ctx,
+                "spike_thresh": args.spike_thresh,
+                "burst_len": args.burst_len,
+                "addr_mode": args.addr_mode,
+                "fault_seed": args.fault_seed,
+            },
+            "train_report": {k: rep[k] for k in rep if k not in ("Q", "pulls", "action_labels")},
+            "Q": rep["Q"],
+            "pulls": rep["pulls"],
+            "action_labels": rep["action_labels"],
+            "best_action": rep["best_action"],
+        }
+        with open(args.out, "w") as f:
+            json.dump(out, f, indent=2)
+        print(f"\nSaved model: {args.out}")
+        print(f"Best action: {rep['best_action']}")
+        return
+
+    if args.cmd == "eval":
+        with open(args.model) as f:
+            model = json.load(f)
+        best_action = model["best_action"]
+        rep = eval_best(
+            exe=args.exe, config=args.config, action_set=action_set,
+            best_action_label=best_action, eval_steps=args.eval_steps,
+            addr_base=args.addr_base, stride=args.stride, n_addrs=args.n_addrs,
+            ctx=args.ctx, spike_thresh=args.spike_thresh,
+            burst_len=args.burst_len, addr_mode=args.addr_mode,
+            fault_seed=args.fault_seed
+        )
+        print(json.dumps(rep, indent=2))
+        return
+
+    if args.cmd == "compare":
+        base = run_baseline(
+            exe=args.exe, config=args.config, action_set=action_set,
+            steps_per_action=args.steps_per_action,
+            addr_base=args.addr_base, stride=args.stride, n_addrs=args.n_addrs,
+            ctx=args.ctx, spike_thresh=args.spike_thresh,
+            burst_len=args.burst_len, addr_mode=args.addr_mode,
+            fault_seed=args.fault_seed
+        )
+        print("\n[compare] baseline done")
+
+        train_rep = train_bandit(
+            exe=args.exe, config=args.config, action_set=action_set,
+            episodes=args.episodes, steps_per_ep=args.steps_per_ep,
+            epsilon=args.epsilon, alpha=args.alpha,
+            addr_base=args.addr_base, stride=args.stride, n_addrs=args.n_addrs,
+            ctx=args.ctx, spike_thresh=args.spike_thresh,
+            burst_len=args.burst_len, addr_mode=args.addr_mode,
+            fault_seed=args.fault_seed
+        )
+        best_action = train_rep["best_action"]
+        print("\n[compare] train done, best =", best_action)
+
+        ev = eval_best(
+            exe=args.exe, config=args.config, action_set=action_set,
+            best_action_label=best_action, eval_steps=args.eval_steps,
+            addr_base=args.addr_base, stride=args.stride, n_addrs=args.n_addrs,
+            ctx=args.ctx, spike_thresh=args.spike_thresh,
+            burst_len=args.burst_len, addr_mode=args.addr_mode,
+            fault_seed=args.fault_seed
+        )
+        print("\n[compare] eval done")
+
+        summary = {
+            "region_bytes": region_bytes(args.n_addrs, args.stride),
+            "baseline_ttff_ce_s": base.get("ttff_ce_s"),
+            "baseline_ttff_ue_s": base.get("ttff_ue_s"),
+            "rl_train_ttff_ce_s": train_rep.get("ttff_ce_s"),
+            "rl_train_ttff_ue_s": train_rep.get("ttff_ue_s"),
+            "rl_eval_ttff_ce_s": ev.get("ttff_ce_s"),
+            "rl_eval_ttff_ue_s": ev.get("ttff_ue_s"),
+            "baseline_faults_per_min": base.get("faults_per_min"),
+            "rl_train_faults_per_min": train_rep.get("faults_per_min"),
+            "rl_eval_faults_per_min": ev.get("faults_per_min"),
+            "best_action": best_action,
+            "burst_len": args.burst_len,
+            "addr_mode": args.addr_mode,
+        }
+
+        report = {
+            "baseline": base,
+            "train": {k: train_rep[k] for k in train_rep if k not in ("Q", "pulls", "action_labels")},
+            "eval_best": ev,
+            "summary": summary,
+        }
+
+        with open(args.out, "w") as f:
+            json.dump(report, f, indent=2)
+        print(f"\nSaved compare report: {args.out}")
+        print(json.dumps(summary, indent=2))
+        return
+
+    raise RuntimeError("Invalid command")
+
+if __name__ == "__main__":
+    main()
+
+
+
+
+
+
+
+#!/usr/bin/env python3
+# gsat_fault_rl_allinone.py
+#
+# One-file end-to-end:
+#   - Hardcoded pattern.cc catalog (from your paste)
+#   - Expands pattern variants (buswidth + invert) like PatternList::Initialize()
+#   - Talks to an interactive Ramulator2 driver (timing)
+#   - Adds a realistic software fault model (shadow memory + fault injection):
+#       sf, cf, rdf, drdf, wdf, tcf, scf, dccf, irf, icf, hammer, retention
+#   - Baseline exhaustive vs RL bandit (epsilon-greedy)
+#   - Metrics: TTFF(CE/UE), faults/min, latency tail, coverage (patterns + addresses), unique fault types
+#
+# IMPORTANT REALITY CHECK:
+# Ramulator2 is a timing simulator; it does not model bit flips from data patterns.
+# This file adds a realistic *fault-injection layer* so your GSAT patterns actually matter.
+#
+# Driver protocol support:
+#   Preferred (data-aware):
+#       W <addr_hex> <data_hex> <ctx> <max_cycles>
+#       R <addr_hex> <ctx> <max_cycles>
+#     -> DONE <cycles> [DATA 0x...] [FAULT <code>]
+#
+#   Fallback (no data):
+#       REQWAIT <addr_hex> <is_write 0/1> <ctx>
+#       or REQ <R|W> <addr_hex> <ctx> <max_cycles>
+#
+# CLI examples (underscore style):
+#   python3 gsat_fault_rl_allinone.py --exe ./ramulator_driver --config ramulator2/example_config.yaml baseline --steps_per_action 200
+#   python3 gsat_fault_rl_allinone.py --exe ./ramulator_driver --config ramulator2/example_config.yaml train --episodes 200 --steps_per_ep 50 --out rl_model.json
+#   python3 gsat_fault_rl_allinone.py --exe ./ramulator_driver --config ramulator2/example_config.yaml compare --out compare_report.json
+#
+# Scale region:
+#   --addr_base 0x100000 --stride 64 --n_addrs 1048576   # 64MB region (approx)
+#
+# Make stress stronger:
+#   --burst_len 64   # 64 write+read pairs per step
+
+import argparse
+import json
+import random
+import re
+import time
+from dataclasses import dataclass
+from typing import List, Tuple, Optional, Dict, Any, Set
+
+MASK32 = 0xFFFFFFFF
+
+
+# ============================================================
+# A) pattern.cc hardcoded catalog (from your paste)
+# ============================================================
+
+@dataclass(frozen=True)
+class PatternFamily:
+    name: str
+    data_u32: List[int]                # includes last sentinel (C++ uses len-1)
+    weights: Tuple[int, int, int, int] # w32,w64,w128,w256
+
+    @property
+    def count(self) -> int:
+        return max(0, len(self.data_u32) - 1)
+
+
+@dataclass(frozen=True)
+class PatternVariant:
+    family: PatternFamily
+    buswidth: int
+    invert: bool
+    weight: int
+    busshift: int
+
+    @property
+    def label(self) -> str:
+        return f"{self.family.name}{'~' if self.invert else ''}{self.buswidth}"
+
+    def word(self, i: int) -> int:
+        cnt = self.family.count
+        if cnt <= 0:
+            base = 0
+        else:
+            idx = ((i >> self.busshift) % cnt)
+            base = self.family.data_u32[idx] & MASK32
+        if self.invert:
+            base ^= MASK32
+        return base & MASK32
+
+
+def _busshift(buswidth: int) -> int:
+    if buswidth == 32:  return 0
+    if buswidth == 64:  return 1
+    if buswidth == 128: return 2
+    if buswidth == 256: return 3
+    raise ValueError(f"Unsupported buswidth: {buswidth}")
+
+
+# ---- arrays from your paste ----
+walkingOnes_data = [
+  0x00000001, 0x00000002, 0x00000004, 0x00000008,
+  0x00000010, 0x00000020, 0x00000040, 0x00000080,
+  0x00000100, 0x00000200, 0x00000400, 0x00000800,
+  0x00001000, 0x00002000, 0x00004000, 0x00008000,
+  0x00010000, 0x00020000, 0x00040000, 0x00080000,
+  0x00100000, 0x00200000, 0x00400000, 0x00800000,
+  0x01000000, 0x02000000, 0x04000000, 0x08000000,
+  0x10000000, 0x20000000, 0x40000000, 0x80000000,
+  0x40000000, 0x20000000, 0x10000000, 0x08000000,
+  0x04000000, 0x02000000, 0x01000000, 0x00800000,
+  0x00400000, 0x00200000, 0x00100000, 0x00080000,
+  0x00040000, 0x00020000, 0x00010000, 0x00008000,
+  0x00004000, 0x00002000, 0x00001000, 0x00000800,
+  0x00000400, 0x00000200, 0x00000100, 0x00000080,
+  0x00000040, 0x00000020, 0x00000010, 0x00000008,
+  0x00000004, 0x00000002, 0x00000001, 0x00000000
+]
+
+walkingInvOnes_data = [
+  0x00000001, 0xfffffffe, 0x00000002, 0xfffffffd,
+  0x00000004, 0xfffffffb, 0x00000008, 0xfffffff7,
+  0x00000010, 0xffffffef, 0x00000020, 0xffffffdf,
+  0x00000040, 0xffffffbf, 0x00000080, 0xffffff7f,
+  0x00000100, 0xfffffeff, 0x00000200, 0xfffffdff,
+  0x00000400, 0xfffffbff, 0x00000800, 0xfffff7ff,
+  0x00001000, 0xffffefff, 0x00002000, 0xffffdfff,
+  0x00004000, 0xffffbfff, 0x00008000, 0xffff7fff,
+  0x00010000, 0xfffeffff, 0x00020000, 0xfffdffff,
+  0x00040000, 0xfffbffff, 0x00080000, 0xfff7ffff,
+  0x00100000, 0xffefffff, 0x00200000, 0xffdfffff,
+  0x00400000, 0xffbfffff, 0x00800000, 0xff7fffff,
+  0x01000000, 0xfeffffff, 0x02000000, 0xfdffffff,
+  0x04000000, 0xfbffffff, 0x08000000, 0xf7ffffff,
+  0x10000000, 0xefffffff, 0x20000000, 0xdfffffff,
+  0x40000000, 0xbfffffff, 0x80000000, 0x7fffffff,
+  0x40000000, 0xbfffffff, 0x20000000, 0xdfffffff,
+  0x10000000, 0xefffffff, 0x08000000, 0xf7ffffff,
+  0x04000000, 0xfbffffff, 0x02000000, 0xfdffffff,
+  0x01000000, 0xfeffffff, 0x00800000, 0xff7fffff,
+  0x00400000, 0xffbfffff, 0x00200000, 0xffdfffff,
+  0x00100000, 0xffefffff, 0x00080000, 0xfff7ffff,
+  0x00040000, 0xfffbffff, 0x00020000, 0xfffdffff,
+  0x00010000, 0xfffeffff, 0x00008000, 0xffff7fff,
+  0x00004000, 0xffffbfff, 0x00002000, 0xffffdfff,
+  0x00001000, 0xffffefff, 0x00000800, 0xfffff7ff,
+  0x00000400, 0xfffffbff, 0x00000200, 0xfffffdff,
+  0x00000100, 0xfffffeff, 0x00000080, 0xffffff7f,
+  0x00000040, 0xffffffbf, 0x00000020, 0xffffffdf,
+  0x00000010, 0xffffffef, 0x00000008, 0xfffffff7,
+  0x00000004, 0xfffffffb, 0x00000002, 0xfffffffd,
+  0x00000001, 0xfffffffe, 0x00000000, 0xffffffff
+]
+
+walkingZeros_data = [
+  0xfffffffe, 0xfffffffd, 0xfffffffb, 0xfffffff7,
+  0xffffffef, 0xffffffdf, 0xffffffbf, 0xffffff7f,
+  0xfffffeff, 0xfffffdff, 0xfffffbff, 0xfffff7ff,
+  0xffffefff, 0xffffdfff, 0xffffbfff, 0xffff7fff,
+  0xfffeffff, 0xfffdffff, 0xfffbffff, 0xfff7ffff,
+  0xffefffff, 0xffdfffff, 0xffbfffff, 0xff7fffff,
+  0xfeffffff, 0xfdffffff, 0xfbffffff, 0xf7ffffff,
+  0xefffffff, 0xdfffffff, 0xbfffffff, 0x7fffffff,
+  0xbfffffff, 0xdfffffff, 0xefffffff, 0xf7ffffff,
+  0xfbffffff, 0xfdffffff, 0xfeffffff, 0xff7fffff,
+  0xffbfffff, 0xffdfffff, 0xffefffff, 0xfff7ffff,
+  0xfffbffff, 0xfffdffff, 0xfffeffff, 0xffff7fff,
+  0xffffbfff, 0xffffdfff, 0xffffefff, 0xfffff7ff,
+  0xfffffbff, 0xfffffdff, 0xfffffeff, 0xffffff7f,
+  0xffffffbf, 0xffffffdf, 0xffffffef, 0xfffffff7,
+  0xfffffffb, 0xfffffffd, 0xfffffffe, 0xffffffff
+]
+
+OneZero_data      = [0x00000000, 0xffffffff]
+JustZero_data     = [0x00000000, 0x00000000]
+JustOne_data      = [0xffffffff, 0xffffffff]
+JustFive_data     = [0x55555555, 0x55555555]
+JustA_data        = [0xaaaaaaaa, 0xaaaaaaaa]
+FiveA_data        = [0x55555555, 0xaaaaaaaa]
+FiveA8_data       = [0x5aa5a55a, 0xa55a5aa5, 0xa55a5aa5, 0x5aa5a55a]
+Long8b10b_data    = [0x16161616, 0x16161616]
+Short8b10b_data   = [0xb5b5b5b5, 0xb5b5b5b5]
+Checker8b10b_data = [0xb5b5b5b5, 0x4a4a4a4a]
+Five7_data        = [0x55555557, 0x55575555]
+Zero2fd_data      = [0x00020002, 0xfffdfffd]
+
+FAMILIES = [
+    PatternFamily("walkingOnes",    walkingOnes_data,    (1, 1, 2, 1)),
+    PatternFamily("walkingInvOnes", walkingInvOnes_data, (2, 2, 5, 5)),
+    PatternFamily("walkingZeros",   walkingZeros_data,   (1, 1, 2, 1)),
+    PatternFamily("OneZero",        OneZero_data,        (5, 5, 15, 5)),
+    PatternFamily("JustZero",       JustZero_data,       (2, 0, 0, 0)),
+    PatternFamily("JustOne",        JustOne_data,        (2, 0, 0, 0)),
+    PatternFamily("JustFive",       JustFive_data,       (2, 0, 0, 0)),
+    PatternFamily("JustA",          JustA_data,          (2, 0, 0, 0)),
+    PatternFamily("FiveA",          FiveA_data,          (1, 1, 1, 1)),
+    PatternFamily("FiveA8",         FiveA8_data,         (1, 1, 1, 1)),
+    PatternFamily("Long8b10b",      Long8b10b_data,      (2, 0, 0, 0)),
+    PatternFamily("Short8b10b",     Short8b10b_data,     (2, 0, 0, 0)),
+    PatternFamily("Checker8b10b",   Checker8b10b_data,   (1, 0, 0, 1)),
+    PatternFamily("Five7",          Five7_data,          (0, 2, 0, 0)),
+    PatternFamily("Zero2fd",        Zero2fd_data,        (0, 2, 0, 0)),
+]
+
+
+def all_variants(include_zero_weight: bool = False) -> List[PatternVariant]:
+    vars_: List[PatternVariant] = []
+    for fam in FAMILIES:
+        for inv in (False, True):
+            for bw, w in zip((32, 64, 128, 256), fam.weights):
+                if (not include_zero_weight) and w <= 0:
+                    continue
+                vars_.append(PatternVariant(family=fam, buswidth=bw, invert=inv, weight=w, busshift=_busshift(bw)))
+    return vars_
+
+
+def top_k_by_weight(vars_: List[PatternVariant], k: int) -> List[PatternVariant]:
+    ranked = sorted(vars_, key=lambda v: (-v.weight, v.label))
+    return ranked[:k]
+
+
+# ============================================================
+# B) Ramulator interactive client (timing)
+# ============================================================
+
+class RamulatorProc:
     def __init__(self, exe: str, config: str, max_cycles: int = 200000):
         self.exe = exe
         self.config = config
